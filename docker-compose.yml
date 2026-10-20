@@ -1,0 +1,92 @@
+# Docker Compose v2+ (работает через: docker compose up -d)
+# Требования: Docker Engine 20.10+ / Docker Compose v2.20+
+#
+# Использование:
+#   cp .env.example .env && nano .env        # настройте секреты
+#   docker compose build                       # один раз собрать образ
+#   docker compose up -d                       # запустить
+#   docker compose logs -f server              # логи
+#   docker compose down                          # остановить
+
+services:
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+      args:
+        SAM2_MODEL_NAME: ${SAM2_MODEL_NAME:-facebook/sam2.1-hiera-base-plus}
+        TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-4}
+    image: camelion-recolor:latest
+    container_name: camelion-server
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    environment:
+      PORT: "8001"
+      SAM2_MODEL_NAME: ${SAM2_MODEL_NAME:-facebook/sam2.1-hiera-base-plus}
+      TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-4}
+      HF_HOME: /home/appuser/.cache/huggingface
+      LOG_MODE: ${LOG_MODE:-prod}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AI_BACKEND: ${AI_BACKEND:-sam2-local}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      CLOUDFLARE_KLEIN_MODEL: ${CLOUDFLARE_KLEIN_MODEL:-@cf/black-forest-labs/flux-2-klein-4b}
+      CLOUDFLARE_KLEIN_SIZE: ${CLOUDFLARE_KLEIN_SIZE:-1024}
+      CLOUDFLARE_KLEIN_GUIDANCE: ${CLOUDFLARE_KLEIN_GUIDANCE:-3.5}
+      CLOUDFLARE_TIMEOUT: ${CLOUDFLARE_TIMEOUT:-120}
+      CLOUDFLARE_MAX_RETRIES: ${CLOUDFLARE_MAX_RETRIES:-1}
+      CLOUDFLARE_KLEIN_ATTEMPTS: ${CLOUDFLARE_KLEIN_ATTEMPTS:-2}
+      CLOUDFLARE_DETECTION_ENABLED: ${CLOUDFLARE_DETECTION_ENABLED:-0}
+      CLOUDFLARE_DETECTION_MODEL: ${CLOUDFLARE_DETECTION_MODEL:-@cf/facebook/detr-resnet-50}
+      CLOUDFLARE_DETECTION_MIN_SCORE: ${CLOUDFLARE_DETECTION_MIN_SCORE:-0.35}
+      CLOUDFLARE_ALLOW_LOCAL_FALLBACK: ${CLOUDFLARE_ALLOW_LOCAL_FALLBACK:-0}
+      MAX_INFERENCE_SIZE: ${MAX_INFERENCE_SIZE:-1536}
+      OPENCV_NUM_THREADS: ${OPENCV_NUM_THREADS:-1}
+      API_KEYS: ${API_KEYS:?Set API_KEYS in .env before starting the API}
+    expose:
+      - "8001"
+    volumes:
+      - ./server/debug_output:/app/debug_output
+      - ./server/model_cache:/home/appuser/.cache/huggingface
+    networks:
+      - camelion-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=5)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 180s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
+        reservations:
+          memory: 2G
+          cpus: "1.0"
+
+  nginx:
+    image: nginx:alpine
+    container_name: camelion-nginx
+    restart: unless-stopped
+    init: true
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - camelion-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  camelion-network:
+    driver: bridge
