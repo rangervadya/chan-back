@@ -15,6 +15,8 @@ import numpy as np
 from .base import SegmentationResult
 from logger import get_logger
 
+_logger = get_logger(__name__)
+
 _LOCK = threading.Lock()
 _PREDICTOR: Any | None = None
 _PREDICTOR_MODEL_ID: str | None = None
@@ -84,16 +86,22 @@ def _resolve_model(requested: str | None = None) -> tuple[str, bool]:
 
     Resolution order:
       1. Explicit ``model_name`` argument (used by callers/tests).
-      2. ``SAM2_LOCAL_MODEL_PATH`` env var — a local directory path; implies
-         ``local_files_only=True`` so no network is attempted.
+      2. ``SAM2_LOCAL_MODEL_PATH`` env var — a local directory path; if the
+         directory exists, loads from disk in offline mode. If it doesn't
+         exist yet, falls through to HF download so first startup still works.
       3. ``SAM2_MODEL_NAME`` env var (HF repo id or local path).
       4. ``DEFAULT_MODEL``.
 
     Returns ``(model_path_or_id, local_files_only)``.
     """
     local_path = os.getenv("SAM2_LOCAL_MODEL_PATH", "").strip()
-    if local_path:
+    if local_path and os.path.isdir(local_path):
         return local_path, True
+
+    if local_path and not os.path.isdir(local_path):
+        _logger.warning(
+            "SAM2_LOCAL_MODEL_PATH='%s' does not exist yet; falling back to HF download", local_path
+        )
 
     requested = (requested or os.getenv("SAM2_MODEL_NAME", DEFAULT_MODEL)).strip()
     if not requested:
@@ -149,8 +157,7 @@ def _load_local_predictor(model_path: str, device: str) -> Any:
                     f"No config YAML found in '{model_path}' or in the sam2 package configs."
                 )
 
-    logger = get_logger(__name__)
-    logger.info("Loading SAM 2 from local dir: checkpoint=%s, config=%s, device=%s",
+    _logger.info("Loading SAM 2 from local dir: checkpoint=%s, config=%s, device=%s",
                 os.path.basename(checkpoint), os.path.basename(config_file), device)
 
     sam_model = build_sam2(config_file=config_file, checkpoint=checkpoint, device=device)
