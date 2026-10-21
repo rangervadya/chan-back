@@ -11,6 +11,12 @@ SAM2_LOCAL_MODEL_PATH = os.getenv("SAM2_LOCAL_MODEL_PATH", "").strip()
 # Если SAM2_LOCAL_FILES_ONLY=1, from_pretrained работает только с локальным кэшем/HF home,
 # без обращения к сети (удобно на сервере без доступа к Hugging Face).
 SAM2_LOCAL_FILES_ONLY = os.getenv("SAM2_LOCAL_FILES_ONLY", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+# Force huggingface_hub offline mode as well — works even if a library
+# doesn't accept local_files_only as an explicit kwarg.
+# Set explicitly (not setdefault) so runtime env var overrides Dockerfile ENV.
+os.environ["HF_HUB_OFFLINE"] = "1" if SAM2_LOCAL_FILES_ONLY else "0"
+
 # Идентификатор модели в Hugging Face или локальный путь.
 # Приоритет: SAM2_LOCAL_MODEL_PATH > SAM2_MODEL_NAME > "facebook/sam2.1-hiera-base-plus".
 SAM2_MODEL_NAME = (

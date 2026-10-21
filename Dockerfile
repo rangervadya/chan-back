@@ -11,6 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/home/appuser/.cache/huggingface \
     HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_OFFLINE=${SAM2_LOCAL_FILES_ONLY} \
     TORCH_NUM_THREADS=${TORCH_NUM_THREADS} \
     SAM2_MODEL_NAME=${SAM2_MODEL_NAME} \
     SAM2_LOCAL_FILES_ONLY=${SAM2_LOCAL_FILES_ONLY} \
@@ -40,7 +41,7 @@ RUN python -m pip install -r requirements.txt
 #    Pinned PyPI release (not git+https) avoids cloning the full repo each build
 #    and the slow "Installing build dependencies" isolation step.
 RUN python -m pip install "huggingface-hub>=0.25.0" "hydra-core>=1.3.2" "iopath>=0.1.10" \
-    && pip install --no-deps "sam2==1.0.1"
+    && pip install --no-deps "sam2==1.1.0"
 
 COPY app.py config.py logger.py ./
 COPY recolor ./recolor
