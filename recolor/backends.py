@@ -67,7 +67,7 @@ class Sam2LocalBackend(BaseBackend):
         try:
             seg = segment_with_sam2(
                 image, request.point_x, request.point_y,
-                model_name=_cfg("SAM2_MODEL_NAME", "facebook/sam2.1-hiera-tiny"),
+                model_name=_cfg("SAM2_MODEL_NAME", "facebook/sam2.1-hiera-base-plus"),
             )
         except Sam2UnavailableError:
             raise

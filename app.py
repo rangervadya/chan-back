@@ -29,7 +29,7 @@ except Exception:
 
 from logger import get_logger
 from config import (
-    SAM2_MODEL_NAME, SAM2_JITTER_OFFSETS, SAM2_MIN_CONSISTENCY_IOU, SAM2_MIN_MASK_AREA,
+    SAM2_MODEL_NAME, SAM2_LOCAL_MODEL_PATH, SAM2_LOCAL_FILES_ONLY, SAM2_JITTER_OFFSETS, SAM2_MIN_CONSISTENCY_IOU, SAM2_MIN_MASK_AREA,
     SAM2_MASK_CONSENSUS, SAM2_MASK_CONSENSUS_MIN_RATIO,
     FLUX_MODEL_NAME, FLUX_TORCH_DTYPE_NAME,
     FLUX_MAX_STEPS, FLUX_DEFAULT_GUIDANCE_SCALE, FLUX_DEFAULT_NUM_INFERENCE_STEPS,
@@ -172,7 +172,9 @@ def ensure_legacy_models():
     if _predictor is None:
         try:
             from sam2.sam2_image_predictor import SAM2ImagePredictor
-            _predictor = SAM2ImagePredictor.from_pretrained(SAM2_MODEL_NAME)
+            _predictor = SAM2ImagePredictor.from_pretrained(
+                SAM2_MODEL_NAME, device=_device, local_files_only=SAM2_LOCAL_FILES_ONLY
+            )
             _predictor.model = _predictor.model.to(_device).eval()
             logger.info("✅ SAM-2 Hiera-L loaded")
         except Exception as e:

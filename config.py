@@ -6,7 +6,18 @@ logger = get_logger(__name__)
 
 
 # ---------- Параметры SAM-2 ----------
-SAM2_MODEL_NAME = os.getenv("SAM2_MODEL_NAME", "facebook/sam2.1-hiera-tiny").strip() or "facebook/sam2.1-hiera-tiny"
+# Локальная директория с загруженной моделью (берётся вместо HF repo id приоритетнее).
+SAM2_LOCAL_MODEL_PATH = os.getenv("SAM2_LOCAL_MODEL_PATH", "").strip()
+# Если SAM2_LOCAL_FILES_ONLY=1, from_pretrained работает только с локальным кэшем/HF home,
+# без обращения к сети (удобно на сервере без доступа к Hugging Face).
+SAM2_LOCAL_FILES_ONLY = os.getenv("SAM2_LOCAL_FILES_ONLY", "1").strip().lower() in {"1", "true", "yes", "on"}
+# Идентификатор модели в Hugging Face или локальный путь.
+# Приоритет: SAM2_LOCAL_MODEL_PATH > SAM2_MODEL_NAME > "facebook/sam2.1-hiera-base-plus".
+SAM2_MODEL_NAME = (
+    SAM2_LOCAL_MODEL_PATH
+    or os.getenv("SAM2_MODEL_NAME", "facebook/sam2.1-hiera-base-plus").strip()
+    or "facebook/sam2.1-hiera-base-plus"
+)
 # Количество джиттер-прогонов для consistency-check сегментации
 SAM2_JITTER_OFFSETS = [(8, 0), (-8, 0), (0, 8), (0, -8)]
 # Порог согласованности масок (mean IoU). Ниже — предупреждение

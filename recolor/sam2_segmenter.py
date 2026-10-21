@@ -46,11 +46,52 @@ def _as_numpy(value: Any) -> np.ndarray:
     return np.asarray(value)
 
 
+DEFAULT_MODEL = "facebook/sam2.1-hiera-base-plus"
+
+
+def _model_variant(model_id: str | None) -> str:
+    """Extract the Hiera variant suffix from a model path or repo id.
+
+    e.g. ``facebook/sam2.1-hiera-base-plus`` -> ``base-plus``,
+    ``/models/facebook--sam2.1-hiera-large`` -> ``large``.
+    """
+    if not model_id:
+        return "base-plus"
+    base = os.path.basename(model_id.rstrip("/"))
+    name = base.replace("facebook--", "").replace("facebook/", "")
+    for prefix in ("sam2.1-hiera-", "sam2-hiera-", "sam2.1-", "sam2-"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _resolve_model(requested: str | None = None) -> tuple[str, bool]:
+    """Resolve the effective model path and local_files_only flag.
+
+    Resolution order:
+      1. Explicit ``model_name`` argument (used by callers/tests).
+      2. ``SAM2_LOCAL_MODEL_PATH`` env var — a local directory path; implies
+         ``local_files_only=True`` so no network is attempted.
+      3. ``SAM2_MODEL_NAME`` env var (HF repo id or local path).
+      4. ``DEFAULT_MODEL``.
+
+    Returns ``(model_path_or_id, local_files_only)``.
+    """
+    local_path = os.getenv("SAM2_LOCAL_MODEL_PATH", "").strip()
+    if local_path:
+        return local_path, True
+
+    requested = (requested or os.getenv("SAM2_MODEL_NAME", DEFAULT_MODEL)).strip()
+    if not requested:
+        requested = DEFAULT_MODEL
+
+    local_files_only = os.getenv("SAM2_LOCAL_FILES_ONLY", "1").strip().lower() in {"1", "true", "yes", "on"}
+    return requested, local_files_only
+
+
 def _get_predictor(model_name: str | None = None):
     global _PREDICTOR, _PREDICTOR_MODEL_ID, _PREDICTOR_DEVICE
-    requested = (model_name or os.getenv("SAM2_MODEL_NAME", "facebook/sam2.1-hiera-tiny")).strip()
-    if not requested:
-        requested = "facebook/sam2.1-hiera-tiny"
+    requested, local_files_only = _resolve_model(model_name)
     if _PREDICTOR is not None and _PREDICTOR_MODEL_ID == requested:
         return _PREDICTOR
 
@@ -79,7 +120,9 @@ def _get_predictor(model_name: str | None = None):
         except Exception:
             device = "cpu"
         try:
-            predictor = SAM2ImagePredictor.from_pretrained(requested, device=device)
+            predictor = SAM2ImagePredictor.from_pretrained(
+                requested, device=device, local_files_only=local_files_only
+            )
             if getattr(predictor, "model", None) is not None:
                 predictor.model = predictor.model.to(device).eval()
         except Exception as exc:
@@ -233,7 +276,7 @@ def segment_with_sam2(
 
     return SegmentationResult(
         mask=mask.astype(bool),
-        method="sam2.1-hiera-tiny-point",
+        method=f"sam2.1-hiera-{_model_variant(_PREDICTOR_MODEL_ID)}-point",
         area_ratio=float(mask.mean()),
         confidence=float(np.clip(np.mean(selected_scores), 0.0, 1.0)),
         object_label="selected object",
