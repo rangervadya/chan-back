@@ -24,6 +24,8 @@ services:
     environment:
       PORT: "8001"
       SAM2_MODEL_NAME: ${SAM2_MODEL_NAME:-facebook/sam2.1-hiera-base-plus}
+      SAM2_LOCAL_MODEL_PATH: ${SAM2_LOCAL_MODEL_PATH:-}
+      SAM2_LOCAL_FILES_ONLY: ${SAM2_LOCAL_FILES_ONLY:-1}
       TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-4}
       HF_HOME: /home/appuser/.cache/huggingface
       LOG_MODE: ${LOG_MODE:-prod}

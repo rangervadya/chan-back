@@ -4,6 +4,7 @@ FROM python:3.11-slim
 
 ARG TORCH_NUM_THREADS=2
 ARG SAM2_MODEL_NAME=facebook/sam2.1-hiera-base-plus
+ARG SAM2_LOCAL_FILES_ONLY=1
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -12,6 +13,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
     TORCH_NUM_THREADS=${TORCH_NUM_THREADS} \
     SAM2_MODEL_NAME=${SAM2_MODEL_NAME} \
+    SAM2_LOCAL_FILES_ONLY=${SAM2_LOCAL_FILES_ONLY} \
     MAX_IMAGE_SIZE_BYTES=20971520 \
     MAX_IMAGE_DIMENSION=8192 \
     MAX_INFERENCE_SIZE=1536
@@ -34,9 +36,11 @@ RUN python -m pip install --upgrade pip \
 RUN python -m pip install -r requirements.txt
 
 # 3. Install SAM 2 + its non-torch deps.
-#    --no-deps on sam2 prevents pip from reinstalling/ upgrading torch from PyPI.
+#    --no-deps on sam2 prevents pip from reinstalling/upgrading torch from PyPI.
+#    Pinned PyPI release (not git+https) avoids cloning the full repo each build
+#    and the slow "Installing build dependencies" isolation step.
 RUN python -m pip install "huggingface-hub>=0.25.0" "hydra-core>=1.3.2" "iopath>=0.1.10" \
-    && pip install --no-deps "git+https://github.com/facebookresearch/sam2.git"
+    && pip install --no-deps "sam2==1.0.1"
 
 COPY app.py config.py logger.py ./
 COPY recolor ./recolor
