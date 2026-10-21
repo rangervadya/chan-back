@@ -107,6 +107,16 @@ def _resolve_model(requested: str | None = None) -> tuple[str, bool]:
     if not requested:
         requested = DEFAULT_MODEL
 
+    # If the resolved value is a local path that doesn't exist, fall back to
+    # the default HF model ID so we don't hand a broken path to from_pretrained.
+    if requested != DEFAULT_MODEL and not os.path.isdir(requested) and (
+        requested.startswith("/") or requested.startswith("./") or requested.startswith("../")
+    ):
+        _logger.warning(
+            "Model path '%s' does not exist; falling back to %s", requested, DEFAULT_MODEL
+        )
+        requested = DEFAULT_MODEL
+
     local_files_only = os.getenv("SAM2_LOCAL_FILES_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
     return requested, local_files_only
 

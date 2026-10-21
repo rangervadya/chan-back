@@ -18,12 +18,10 @@ SAM2_LOCAL_FILES_ONLY = os.getenv("SAM2_LOCAL_FILES_ONLY", "0").strip().lower() 
 os.environ["HF_HUB_OFFLINE"] = "1" if (SAM2_LOCAL_FILES_ONLY or SAM2_LOCAL_MODEL_PATH) else "0"
 
 # Идентификатор модели в Hugging Face или локальный путь.
-# Приоритет: SAM2_LOCAL_MODEL_PATH > SAM2_MODEL_NAME > "facebook/sam2.1-hiera-base-plus".
-SAM2_MODEL_NAME = (
-    SAM2_LOCAL_MODEL_PATH
-    or os.getenv("SAM2_MODEL_NAME", "facebook/sam2.1-hiera-base-plus").strip()
-    or "facebook/sam2.1-hiera-base-plus"
-)
+# SAM2_LOCAL_MODEL_PATH (если существует) используется отдельно в sam2_segmenter._resolve_model,
+# поэтому здесь мы НЕ затираем SAM2_MODEL_NAME локальным путём — иначе from_pretrained
+# получит непроверенный путь и упадёт с KeyError, если директория ещё не смонтирована.
+SAM2_MODEL_NAME = os.getenv("SAM2_MODEL_NAME", "facebook/sam2.1-hira-base-plus").strip() or "facebook/sam2.1-hira-base-plus"
 # Количество джиттер-прогонов для consistency-check сегментации
 SAM2_JITTER_OFFSETS = [(8, 0), (-8, 0), (0, 8), (0, -8)]
 # Порог согласованности масок (mean IoU). Ниже — предупреждение
