@@ -25,7 +25,7 @@ services:
       PORT: "8001"
       SAM2_MODEL_NAME: ${SAM2_MODEL_NAME:-facebook/sam2.1-hiera-base-plus}
       SAM2_LOCAL_MODEL_PATH: ${SAM2_LOCAL_MODEL_PATH:-}
-      SAM2_LOCAL_FILES_ONLY: ${SAM2_LOCAL_FILES_ONLY:-1}
+      SAM2_LOCAL_FILES_ONLY: ${SAM2_LOCAL_FILES_ONLY:-0}
       TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-4}
       HF_HOME: /home/appuser/.cache/huggingface
       LOG_MODE: ${LOG_MODE:-prod}
@@ -51,6 +51,10 @@ services:
     volumes:
       - ./server/debug_output:/app/debug_output
       - ./server/model_cache:/home/appuser/.cache/huggingface
+      # Mount local model directory if SAM2_LOCAL_MODEL_PATH is set on the host.
+      # The host path is configurable via SAM2_MODELS_DIR env var (defaults to
+      # ../models relative to this docker-compose.yml).
+      - ${SAM2_MODELS_DIR:-../models}:/app/models:ro
     networks:
       - camelion-network
     healthcheck:

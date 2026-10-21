@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 
 from .base import SegmentationResult
+from logger import get_logger
 
 _LOCK = threading.Lock()
 _PREDICTOR: Any | None = None
@@ -53,16 +54,29 @@ def _model_variant(model_id: str | None) -> str:
     """Extract the Hiera variant suffix from a model path or repo id.
 
     e.g. ``facebook/sam2.1-hiera-base-plus`` -> ``base-plus``,
-    ``/models/facebook--sam2.1-hiera-large`` -> ``large``.
+    ``/models/sam2.1-hira-base-plus`` -> ``base-plus``.
     """
     if not model_id:
         return "base-plus"
     base = os.path.basename(model_id.rstrip("/"))
     name = base.replace("facebook--", "").replace("facebook/", "")
-    for prefix in ("sam2.1-hiera-", "sam2-hiera-", "sam2.1-", "sam2-"):
+    for prefix in ("sam2.1-hiera-", "sam2.1-hira-", "sam2-hiera-", "sam2.1-", "sam2-"):
         if name.startswith(prefix):
             return name[len(prefix):]
     return name
+
+
+# Maps Hiera variant → config YAML filename inside the sam2 package.
+_CONFIG_FILES = {
+    "base-plus": "sam2.1_hira_b+.yaml",
+    "b+": "sam2.1_hira_b+.yaml",
+    "tiny": "sam2.1_hira_t.yaml",
+    "small": "sam2.1_hira_s.yaml",
+    "t": "sam2.1_hira_t.yaml",
+    "s": "sam2.1_hira_s.yaml",
+    "large": "sam2.1_hira_l.yaml",
+    "l": "sam2.1_hira_l.yaml",
+}
 
 
 def _resolve_model(requested: str | None = None) -> tuple[str, bool]:
@@ -85,8 +99,63 @@ def _resolve_model(requested: str | None = None) -> tuple[str, bool]:
     if not requested:
         requested = DEFAULT_MODEL
 
-    local_files_only = os.getenv("SAM2_LOCAL_FILES_ONLY", "1").strip().lower() in {"1", "true", "yes", "on"}
+    local_files_only = os.getenv("SAM2_LOCAL_FILES_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
     return requested, local_files_only
+
+
+def _find_local_file(directory: str, patterns: list[str]) -> str | None:
+    """Find the first file matching any of the given suffixes in a directory."""
+    try:
+        for entry in sorted(os.listdir(directory)):
+            lower = entry.lower()
+            for pat in patterns:
+                if lower.endswith(pat.lower()):
+                    return os.path.join(directory, entry)
+    except OSError:
+        return None
+    return None
+
+
+def _load_local_predictor(model_path: str, device: str) -> Any:
+    """Load SAM 2 directly from a local directory containing checkpoint + config files.
+
+    Falls back to sam2's bundled configs when no YAML is found in the directory.
+    """
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+    checkpoint = _find_local_file(model_path, [".pt"])
+    if not checkpoint:
+        raise Sam2UnavailableError(
+            f"No checkpoint (.pt) file found in '{model_path}'. "
+            "Place the SAM 2 checkpoint (e.g. sam2.1_hira_base_plus.pt) in this directory."
+        )
+
+    config_file = _find_local_file(model_path, [".yaml"])
+    if not config_file:
+        import sam2
+        pkg_configs = os.path.join(os.path.dirname(sam2.__file__), "configs")
+        variant = _model_variant(model_path)
+        config_name = _CONFIG_FILES.get(variant, _CONFIG_FILES.get(variant.replace("-", "_")))
+        if config_name:
+            candidate = os.path.join(pkg_configs, config_name)
+            if os.path.isfile(candidate):
+                config_file = candidate
+        if not config_file or not os.path.isfile(config_file):
+            yamls = sorted(os.listdir(pkg_configs)) if os.path.isdir(pkg_configs) else []
+            config_file = os.path.join(pkg_configs, yamls[0]) if yamls else None
+            if not config_file or not os.path.isfile(config_file):
+                raise Sam2UnavailableError(
+                    f"No config YAML found in '{model_path}' or in the sam2 package configs."
+                )
+
+    logger = get_logger(__name__)
+    logger.info("Loading SAM 2 from local dir: checkpoint=%s, config=%s, device=%s",
+                os.path.basename(checkpoint), os.path.basename(config_file), device)
+
+    sam_model = build_sam2(config_file=config_file, checkpoint=checkpoint, device=device)
+    predictor = SAM2ImagePredictor(sam_model)
+    return predictor
 
 
 def _get_predictor(model_name: str | None = None):
@@ -120,9 +189,12 @@ def _get_predictor(model_name: str | None = None):
         except Exception:
             device = "cpu"
         try:
-            predictor = SAM2ImagePredictor.from_pretrained(
-                requested, device=device, local_files_only=local_files_only
-            )
+            if os.path.isdir(requested):
+                predictor = _load_local_predictor(requested, device)
+            else:
+                predictor = SAM2ImagePredictor.from_pretrained(
+                    requested, device=device, local_files_only=local_files_only
+                )
             if getattr(predictor, "model", None) is not None:
                 predictor.model = predictor.model.to(device).eval()
         except Exception as exc:
