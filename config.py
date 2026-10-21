@@ -12,16 +12,17 @@ SAM2_LOCAL_MODEL_PATH = os.getenv("SAM2_LOCAL_MODEL_PATH", "").strip()
 # без обращения к сети (удобно на сервере без доступа к Hugging Face).
 SAM2_LOCAL_FILES_ONLY = os.getenv("SAM2_LOCAL_FILES_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
 
-# Force huggingface_hub offline mode as well — works even if a library
-# doesn't accept local_files_only as an explicit kwarg.
-# Set explicitly (not setdefault) so runtime env var overrides Dockerfile ENV.
-os.environ["HF_HUB_OFFLINE"] = "1" if (SAM2_LOCAL_FILES_ONLY or SAM2_LOCAL_MODEL_PATH) else "0"
+# Force huggingface_hub offline mode only when the local model dir actually exists
+# OR SAM2_LOCAL_FILES_ONLY is explicitly set. Otherwise allow HF download as fallback.
+os.environ["HF_HUB_OFFLINE"] = "1" if (
+    SAM2_LOCAL_FILES_ONLY or (SAM2_LOCAL_MODEL_PATH and os.path.isdir(SAM2_LOCAL_MODEL_PATH))
+) else "0"
 
 # Идентификатор модели в Hugging Face или локальный путь.
 # SAM2_LOCAL_MODEL_PATH (если существует) используется отдельно в sam2_segmenter._resolve_model,
 # поэтому здесь мы НЕ затираем SAM2_MODEL_NAME локальным путём — иначе from_pretrained
 # получит непроверенный путь и упадёт с KeyError, если директория ещё не смонтирована.
-SAM2_MODEL_NAME = os.getenv("SAM2_MODEL_NAME", "facebook/sam2.1-hira-base-plus").strip() or "facebook/sam2.1-hira-base-plus"
+SAM2_MODEL_NAME = os.getenv("SAM2_MODEL_NAME", "facebook/sam2.1-hiera-base-plus").strip() or "facebook/sam2.1-hiera-base-plus"
 # Количество джиттер-прогонов для consistency-check сегментации
 SAM2_JITTER_OFFSETS = [(8, 0), (-8, 0), (0, 8), (0, -8)]
 # Порог согласованности масок (mean IoU). Ниже — предупреждение
