@@ -219,11 +219,20 @@ _device = "cpu"
 # --------------------- Проверка API-ключа ---------------------
 def verify_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
     """Проверяет API-ключ из заголовка X-API-Key.
+
     Если серверные ключи не заданы (VALID_API_KEYS пуст), проверка пропускается."""
     if not VALID_API_KEYS:
         return None
-    if not x_api_key or x_api_key not in VALID_API_KEYS:
-        logger.warning("⛔ Rejected request with invalid/missing API key")
+    if not x_api_key:
+        logger.warning("⛔️ Rejected: no X-API-Key header received (expected %d key(s))", len(VALID_API_KEYS))
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    if x_api_key not in VALID_API_KEYS:
+        masked = x_api_key[:6] + "..." if len(x_api_key) > 6 else x_api_key[:1] + "..."
+        logger.warning(
+            "⛔️ Rejected: X-API-Key '%s' does not match any of %d valid key(s)",
+            masked,
+            len(VALID_API_KEYS),
+        )
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return x_api_key
 
@@ -636,7 +645,11 @@ async def ai_recolor(
     api_key: str | None = Depends(verify_api_key),
 ):
     start_time = time.time()
+    client_ip = request.client.host if request.client else "unknown"
+    has_api_key = "x-api-key" in {k.lower() for k in request.headers}
     logger.info("📥 ===== NEW REQUEST =====")
+    logger.info("   Client IP: %s", client_ip)
+    logger.info("   X-API-Key header present: %s", has_api_key)
     logger.debug(f"   Filename: {image.filename}")
     logger.debug(f"   point_x: {point_x}, point_y: {point_y}")
     logger.debug(f"   object_name: {object_name}, material: {material}, color_hex: {color_hex}, color_name: {color_name}, color_rgb: ({color_r}, {color_g}, {color_b}), strength: {strength}, guidance_scale: {guidance_scale}, steps: {num_inference_steps}, patina: {patina}")
