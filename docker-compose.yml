@@ -1,36 +1,41 @@
-# Docker Compose v2+ (работает через: docker compose up -d)
-# Требования: Docker Engine 20.10+ / Docker Compose v2.20+
-#
+
+# Docker Compose v2+
 # Использование:
-#   cp .env.example .env && nano .env        # настройте секреты
-#   docker compose build                       # один раз собрать образ
-#   docker compose up -d                       # запустить
-#   docker compose logs -f server              # логи
-#   docker compose down                          # остановить
+#   docker compose config
+#   docker compose build
+#   docker compose up -d
+#   docker compose logs -f server
+#   docker compose down
 
 services:
   server:
     build:
-      context: ./server
+      context: .
       dockerfile: Dockerfile
       args:
         SAM2_MODEL_NAME: ${SAM2_MODEL_NAME:-facebook/sam2.1-hiera-base-plus}
         TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-4}
+
     image: camelion-recolor:latest
     container_name: camelion-server
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
+
     environment:
       PORT: "8001"
+
       SAM2_MODEL_NAME: ${SAM2_MODEL_NAME:-facebook/sam2.1-hiera-base-plus}
       SAM2_LOCAL_MODEL_PATH: ${SAM2_LOCAL_MODEL_PATH:-}
       SAM2_LOCAL_FILES_ONLY: ${SAM2_LOCAL_FILES_ONLY:-0}
       TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-4}
+
       HF_HOME: /home/appuser/.cache/huggingface
+
       LOG_MODE: ${LOG_MODE:-prod}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       AI_BACKEND: ${AI_BACKEND:-sam2-local}
+
       CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
       CLOUDFLARE_KLEIN_MODEL: ${CLOUDFLARE_KLEIN_MODEL:-@cf/black-forest-labs/flux-2-klein-4b}
@@ -43,26 +48,34 @@ services:
       CLOUDFLARE_DETECTION_MODEL: ${CLOUDFLARE_DETECTION_MODEL:-@cf/facebook/detr-resnet-50}
       CLOUDFLARE_DETECTION_MIN_SCORE: ${CLOUDFLARE_DETECTION_MIN_SCORE:-0.35}
       CLOUDFLARE_ALLOW_LOCAL_FALLBACK: ${CLOUDFLARE_ALLOW_LOCAL_FALLBACK:-0}
+
       MAX_INFERENCE_SIZE: ${MAX_INFERENCE_SIZE:-1536}
       OPENCV_NUM_THREADS: ${OPENCV_NUM_THREADS:-1}
+
       API_KEYS: ${API_KEYS:?Set API_KEYS in .env before starting the API}
+
     expose:
       - "8001"
+
     volumes:
       - ./server/debug_output:/app/debug_output
       - ./server/model_cache:/home/appuser/.cache/huggingface
-      # Mount local model directory if SAM2_LOCAL_MODEL_PATH is set on the host.
-      # The host path is configurable via SAM2_MODELS_DIR env var (defaults to
-      # ../models relative to this docker-compose.yml).
       - ${SAM2_MODELS_DIR:-../models}:/app/models:ro
+
     networks:
       - camelion-network
+
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=5)"]
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=5)"
       interval: 30s
       timeout: 8s
       retries: 3
       start_period: 180s
+
     deploy:
       resources:
         limits:
@@ -71,23 +84,38 @@ services:
         reservations:
           memory: 2G
           cpus: "1.0"
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
 
   nginx:
     image: nginx:alpine
     container_name: camelion-nginx
     restart: unless-stopped
     init: true
+
     ports:
       - "80:80"
+
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+
     depends_on:
       server:
         condition: service_healthy
+
     networks:
       - camelion-network
+
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost/health"]
+      test:
+        - CMD
+        - wget
+        - --spider
+        - -q
+        - http://localhost/health
       interval: 30s
       timeout: 5s
       retries: 3

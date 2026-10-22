@@ -29,9 +29,9 @@ COPY requirements.txt requirements.sam2.txt ./
 
 # 1. Install CPU-only PyTorch first (avoids CUDA wheels pulling in GPU libs).
 #    MUST precede requirements.sam2.txt so pip sees the CPU torch already present.
-RUN python -m pip install --upgrade pip \
-    && python -m pip install --index-url https://download.pytorch.org/whl/cpu \
-       "torch>=2.6.0" "torchvision>=0.21.0"
+RUN python -m pip install --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/cu126 \
+    "torch==2.14.1" "torchvision==0.29.1"
 
 # 2. Install base service requirements (fastapi, opencv, etc.).
 RUN python -m pip install -r requirements.txt
