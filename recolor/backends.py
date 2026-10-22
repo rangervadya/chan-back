@@ -266,7 +266,7 @@ class _AnalyzingMixin(BaseBackend):
 
 
 class CloudflareBackend(_AnalyzingMixin):
-    """Cloudflare vision plus true generative recoloring and masked compositing."""
+    """Local SAM 2 segmentation followed by Cloudflare FLUX and masked compositing."""
     name = "cloudflare"
 
     def __init__(self, client) -> None:
@@ -288,49 +288,63 @@ class CloudflareBackend(_AnalyzingMixin):
             request.object_name, bool(getattr(request, "patina", False)),
             bool(getattr(request, "from_pipette", False)),
         )
-        bbox = None
-        detected_label = ""
-        det_time = 0.0
-        desc_time = 0.0
-        detector = getattr(self.client, "detect_object", None)
-        if _cfg("CLOUDFLARE_DETECTION_ENABLED", True) and callable(detector):
-            t_det = time.monotonic()
-            try:
-                detection = detector(image, request.point_x, request.point_y)
-                det_time = time.monotonic() - t_det
-                if detection:
-                    bbox, detected_label, score = detection
-                    diag.metric("detected_object", detected_label)
-                    diag.metric("detected_object_score", round(float(score), 4))
-                    diag.metric("detected_object_bbox", list(bbox))
-                    logger.info(
-                        "cloudflare: DETR detection label=%s score=%.3f bbox=%s in %.3fs",
-                        detected_label, float(score), list(bbox), det_time,
-                    )
-            except Exception as exc:  # Detection improves segmentation but isn't image generation.
-                logger.warning("Cloudflare DETR detection unavailable; using point segmentation: %s", exc)
-                diag.metric("object_detection_error", type(exc).__name__)
-
+        # Segmentation is performed locally by SAM 2. The resulting mask is
+        # passed to the Cloudflare FLUX API below; do not substitute a different
+        # segmenter here, because that can select neighbouring objects.
         t_seg = time.monotonic()
-        seg = self._segment(request, bbox=bbox)
+        try:
+            from .sam2_segmenter import segment_with_sam2
+
+            seg = segment_with_sam2(
+                image,
+                request.point_x,
+                request.point_y,
+                model_name=_cfg(
+                    "SAM2_MODEL_NAME",
+                    "facebook/sam2.1-hiera-base-plus",
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "cloudflare: local SAM 2 segmentation failed; FLUX was not called"
+            )
+            raise CloudflareAIError(
+                f"SAM 2 segmentation failed; FLUX generation was not started: {exc}",
+                status=503,
+                retryable=False,
+            ) from exc
+
         seg_time = time.monotonic() - t_seg
-        logger.info("cloudflare: local segment done in %.3fs method=%s", seg_time, seg.method)
+        logger.info(
+            "cloudflare: SAM 2 segmentation done in %.3fs method=%s",
+            seg_time,
+            seg.method,
+        )
+        diag.metric("segmentation_engine", "SAM 2 local")
+
         mask = ops.to_mask_array(seg.mask)
+        if mask.ndim != 2 or mask.shape != image.shape[:2]:
+            raise CloudflareAIError(
+                "SAM 2 returned a mask with an invalid shape: "
+                f"mask={getattr(mask, 'shape', None)}, image={image.shape[:2]}",
+                status=422,
+                retryable=False,
+            )
+
         _capture_segmentation(diag, image, seg)
         if not mask.any():
-            issue = CloudflareAIError("сегментация не выделила объект; генерация отменена, чтобы не вернуть ложный результат", status=422)
-            if _cfg("CLOUDFLARE_ALLOW_LOCAL_FALLBACK", False):
-                return self._local_finish(request, seg, [str(issue)], fallback=True, diag=diag)
-            raise issue
+            raise CloudflareAIError(
+                "SAM 2 returned an empty object mask; FLUX generation was cancelled",
+                status=422,
+                retryable=False,
+            )
 
-        if detected_label:
-            label = detected_label
-            notes = [f"Cloudflare DETR: объект «{label}» (bbox подсказка для сегментации)"]
-        else:
-            t_desc = time.monotonic()
-            label, notes = self._describe(request)
-            desc_time = time.monotonic() - t_desc
-            logger.info("cloudflare: vision describe done in %.3fs label=%r", desc_time, label)
+        # Avoid an extra Cloudflare DETR/vision request before FLUX. The object
+        # label supplied by the client is enough for the current prompt builder.
+        label = (str(request.object_name or "").strip() or "selected object")
+        notes = [
+            "Объект выделен локальной SAM 2; маска передаётся в FLUX через Cloudflare Workers AI."
+        ]
         prompt = build_recolor_prompt(request, label, _color_name(request))
         model_choice = str(_cfg("CLOUDFLARE_RECOLOR_MODEL", "klein")).strip().lower()
         if model_choice not in {"klein", "inpaint"}:
@@ -385,9 +399,12 @@ class CloudflareBackend(_AnalyzingMixin):
         _append_diag_note(notes, summary)
         notes.append(f"генеративная перекраска: {model_choice} ({model_name or 'model name unavailable'})")
         logger.info(
-            "cloudflare: done — backend=%s total=%.3fs (det=%.3fs seg=%.3fs desc=%.3fs gen=%.3fs finish=%.3fs)",
-            self.name, time.monotonic() - t_start,
-            det_time, seg_time, desc_time, gen_time, finish_time,
+            "cloudflare: done — backend=%s total=%.3fs (sam2=%.3fs gen=%.3fs finish=%.3fs)",
+            self.name,
+            time.monotonic() - t_start,
+            seg_time,
+            gen_time,
+            finish_time,
         )
         return BackendResult(image_rgb=out, backend=self.name, segmentation=seg,
                              object_label=label, notes=notes)
