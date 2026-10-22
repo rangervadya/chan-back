@@ -48,6 +48,8 @@ class RecolorRequest:
     # Convenience aliases used by the prompt builder and local recolor.
     target_rgb: tuple[int, int, int] | None = None
     hex_color: str = ""
+    # User-marked points that must stay outside the recolor mask (SAM 2 negative prompts).
+    negative_points: list[tuple[float, float]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.target_rgb is None:
