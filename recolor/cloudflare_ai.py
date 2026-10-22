@@ -382,11 +382,13 @@ class CloudflareAI:
             "height": str(rh),
             "seed": str(seed or 0),
             "guidance": str(self.klein_guidance),
-            "num_steps": "20",
         }
         files = {
-            "image": ("image.png", img_bytes, "image/png"),
-            "mask": ("mask.png", mask_bytes, "image/png"),
+            "input_image_0": (
+                "input_image_0.png",
+                img_bytes,
+                "image/png",
+            ),
         }
         result = self._run_multipart(self.klein_model, fields, files)
         out = _decode_image_result(result, img.shape)

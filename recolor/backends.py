@@ -16,7 +16,7 @@ except Exception:  # pragma: no cover
     cv2 = None
 
 from logger import get_logger
-from config import MATERIAL_COMPLETENESS, METALLIC_VARIANTS, RECOLOR_MASTER_REQUIREMENT
+from config import METALLIC_VARIANTS
 from . import ops
 from .base import BackendResult, RecolorRequest, SegmentationResult
 from .cloudflare_ai import CloudflareAIError
@@ -288,9 +288,10 @@ class CloudflareBackend(_AnalyzingMixin):
             request.object_name, bool(getattr(request, "patina", False)),
             bool(getattr(request, "from_pipette", False)),
         )
-        # Segmentation is performed locally by SAM 2. The resulting mask is
-        # passed to the Cloudflare FLUX API below; do not substitute a different
-        # segmenter here, because that can select neighbouring objects.
+        # Segmentation is performed locally by SAM 2. The mask constrains the
+        # final composite after generation. FLUX.2 Klein's documented API uses
+        # input_image_0 as a reference image and does not document a native mask
+        # input; cloudflare_ai.py must send its supported multipart field names.
         t_seg = time.monotonic()
         try:
             from .sam2_segmenter import segment_with_sam2
@@ -701,44 +702,99 @@ def _color_name(request: RecolorRequest) -> str:
 
 
 def build_recolor_prompt(request: RecolorRequest, object_label: str, color_name: str) -> str:
-    color = color_name or getattr(request, "hex_color", f"#{request.color_hex:06X}")
-    material = (request.material or "wood").lower()
+    """Build a conservative color-edit prompt that prioritizes source preservation.
+
+    FLUX is a generative model, so the prompt explicitly treats the supplied
+    photograph as the reference and forbids redesign. The SAM 2 mask is still
+    used by the backend's post-generation composition; this prompt does not
+    imply that Klein supports a native inpainting-mask parameter.
+    """
+    material = (str(getattr(request, "material", "object") or "object")).strip().lower()
+    color = str(color_name or getattr(request, "hex_color", f"#{request.color_hex:06X}"))
+    hex_color = f"#{int(request.color_hex):06X}"
+    try:
+        rgb = tuple(int(v) for v in (request.color_r, request.color_g, request.color_b))
+    except (AttributeError, TypeError, ValueError):
+        rgb = tuple(int(v) for v in request.target_rgb)
+
+    label = str(object_label or "").strip()
+    if not label or label.lower() in {"object", "selected object", "unknown object"}:
+        label = f"{material} object" if material not in {"", "object"} else "selected object"
+
+    # Only describe the material details that must remain intact. Avoid asking
+    # the model to create a new finish, grain pattern, or design.
     if material == "no_texture":
-        surface = f"{color} smooth matte surface, solid colour"
-    elif material in ("metal", "bronze") or material in _METALLIC_VARIANTS:
-        surface = f"{color} metal, realistic metallic reflections and specular highlights"
+        material_rule = (
+            "Apply a uniform matte color to the existing surface. Do not add texture, "
+            "patterns, grain, gloss, or decorative details. Preserve original shading and edges."
+        )
     elif material == "wood":
-        surface = f"{color} wood, natural fine wood grain"
+        material_rule = (
+            "Preserve the exact existing wood-grain pattern, knots, scratches, wear, "
+            "and finish; do not invent or redraw the grain."
+        )
     elif material == "fabric":
-        surface = f"{color} fabric, woven textile texture and natural folds"
+        material_rule = (
+            "Preserve the exact existing weave, folds, seams, stitching, and fabric finish; "
+            "do not invent a new textile pattern."
+        )
     elif material == "leather":
-        surface = f"{color} leather with realistic fine grain"
-    elif material == "plastic":
-        surface = f"{color} plastic with smooth glossy finish"
+        material_rule = (
+            "Preserve the existing leather grain, creases, stitching, wear, and finish; "
+            "do not create new texture or decorative details."
+        )
     elif material == "glass":
-        surface = f"{color} tinted glass, translucent colored glass, preserve transparent reflections and bright rim highlights"
+        material_rule = (
+            "Tint only the existing visible glass. Preserve transparency, refraction, "
+            "reflections, rim highlights, shape, and the original scene visible through it; "
+            "do not tint the background seen through the glass."
+        )
+    elif material in {"metal", "bronze"} or material in _METALLIC_VARIANTS:
+        material_rule = (
+            "Preserve the existing metal finish, roughness, reflections, specular highlights, "
+            "scratches, and surface wear; change its color without redesigning the finish."
+        )
+    elif material == "plastic":
+        material_rule = (
+            "Preserve the existing plastic gloss or matte finish, molded details, reflections, "
+            "and surface wear. Do not change the object's design."
+        )
     elif material == "ceramic":
-        surface = f"{color} glazed ceramic"
+        material_rule = (
+            "Preserve the existing ceramic glaze, reflections, small imperfections, and finish; "
+            "do not add patterns or decorations."
+        )
     elif material == "concrete":
-        surface = f"{color} rough porous concrete"
+        material_rule = (
+            "Preserve the existing pores, aggregate, cracks, wear, and surface relief; "
+            "do not generate new texture."
+        )
     else:
-        surface = f"{color} {material} surface"
-    key = "metal" if material in _METALLIC_VARIANTS or material == "bronze" else material
-    completeness = MATERIAL_COMPLETENESS.get(key, "Recolor the entire selected surface to {color}.").format(color=color)
-    exact = f"target RGB ({request.color_r}, {request.color_g}, {request.color_b}), hex #{request.color_hex:06X}"
+        material_rule = (
+            "Preserve the object's existing material appearance, texture, finish, and wear; "
+            "do not invent surface details."
+        )
+
     prompt = (
-        f"Edit the provided reference photo, do not create a new scene. Recolor the entire selected {material} object to {surface}; {exact}. "
-        f"{completeness} Keep the exact object shape, camera perspective, geometry, seams, fine texture, lighting, natural shadows, highlights and reflections. "
-        "No untouched patches of the old colour, no new parts, no geometry changes, no background changes. Photorealistic product-photo edit."
+        "STRICT PHOTO EDIT. Use input_image_0 as the source photograph and keep it as the "
+        "same image; do not create a new scene or reinterpret the object. "
+        f"Change only the surface color of the existing {label} to {color} "
+        f"(HEX {hex_color}, RGB {rgb}). "
+        "Preserve the exact identity, silhouette, proportions, geometry, components, joints, "
+        "edges, seams, accessories, position, orientation, camera angle, and perspective. "
+        f"{material_rule} "
+        "Keep the original lighting, luminance gradients, natural shadows, highlights, and "
+        "reflections. Do not add, remove, replace, move, reshape, smooth, sharpen, or redesign "
+        "anything. Do not alter any unselected area or the background. No stylization and no "
+        "new details. If instructions conflict, preserving the source object's structure and "
+        "the original photograph takes priority over creative changes."
     )
-    if material in ("metal", "bronze") and getattr(request, "patina", False):
-        prompt += ", aged patina with subtle natural oxidation"
-    if material == "glass":
-        prompt += " Tint the complete visible glass body including side walls, rim and base, not just the bottom; keep the hand, background seen through the glass, and surroundings unchanged."
+    if material in {"metal", "bronze"} and bool(getattr(request, "patina", False)):
+        prompt += " Add only a subtle, natural aged patina; do not change the geometry or design."
+
     logger.info(
-        "build_recolor_prompt: material=%s key=%s color=%s object_label=%s "
-        "color_name=%s completeness=%s prompt_len=%d",
-        material, key, color, object_label, color_name, completeness, len(prompt),
+        "build_recolor_prompt: material=%s color=%s object_label=%s prompt_len=%d",
+        material, color, label, len(prompt),
     )
     return prompt
 
