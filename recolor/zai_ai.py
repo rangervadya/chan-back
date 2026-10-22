@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 import base64
+import time
 
 import numpy as np
 
@@ -124,6 +125,7 @@ class ZaiVision:
     def object_box(self, image_rgb: np.ndarray, point_x: float, point_y: float
                    ) -> tuple[int, int, int, int] | None:
         """Return ``(x1, y1, x2, y2)`` in source pixels, or None."""
+        t0 = time.monotonic()
         if not self.is_configured:
             raise ZaiAIError("ZaiVision not configured", status=401, retryable=False)
         img = np.asarray(image_rgb, dtype=np.uint8)
@@ -153,6 +155,7 @@ class ZaiVision:
             except Exception as exc:  # noqa: BLE001
                 last = ZaiAIError(f"network error: {exc}", status=0, retryable=True)
                 if attempt >= self.max_retries:
+                    logger.warning("zai: object_box network error after %.2fs: %s", time.monotonic() - t0, exc)
                     raise last from exc
                 attempt += 1
                 continue
@@ -163,12 +166,14 @@ class ZaiVision:
                     raise ZaiAIError("invalid JSON from Z.AI", status=502, retryable=True)
                 text = _extract_text(body)
                 box = _parse_box(text, w, h)
+                logger.info("zai: object_box done in %.2fs box=%s", time.monotonic() - t0, box)
                 if box is not None:
                     return box
                 return None
             message, retryable = _zai_parse_error(resp)
             err = ZaiAIError(message, status=resp.status_code, retryable=retryable)
             if not retryable or attempt >= self.max_retries:
+                logger.warning("zai: object_box error after %.2fs: %s", time.monotonic() - t0, err)
                 raise err
             attempt += 1
             last = err

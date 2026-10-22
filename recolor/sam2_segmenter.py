@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -335,6 +336,7 @@ def _get_predictor(model_name: str | None = None) -> Any:
 
         _logger.info("_get_predictor: loading model=%s device=%s threads=%d", requested, device, threads)
 
+        t_load = time.monotonic()
         try:
             if os.path.isdir(requested):
                 predictor = _load_local_predictor(requested, device)
@@ -359,6 +361,9 @@ def _get_predictor(model_name: str | None = None) -> Any:
                 f"Could not load SAM 2 model '{requested}': "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
+
+        load_time = time.monotonic() - t_load
+        _logger.info("_get_predictor: model loaded in %.3fs", load_time)
 
         _PREDICTOR = predictor
         _PREDICTOR_MODEL_ID = requested
@@ -523,20 +528,27 @@ def segment_with_sam2(
     x = int(np.clip(round(point_x), 0, w - 1))
     y = int(np.clip(round(point_y), 0, h - 1))
 
+    t_start = time.monotonic()
     _logger.info(
         "segment_with_sam2: image=%dx%d point=(%d,%d) model_name=%s",
         w, h, x, y, model_name,
     )
 
+    t_load = time.monotonic()
     predictor = _get_predictor(model_name)
+    load_time = time.monotonic() - t_load
+    _logger.info("segment_with_sam2: predictor ready in %.3fs (cached=%s)", load_time, _PREDICTOR is not None)
 
     try:
         import torch
 
+        t_embed = time.monotonic()
         with torch.inference_mode():
             predictor.set_image(image)
-            _logger.info("segment_with_sam2: image embedding set")
+            embed_time = time.monotonic() - t_embed
+            _logger.info("segment_with_sam2: image embedding set in %.3fs", embed_time)
 
+            t_prim = time.monotonic()
             initial = _select_candidate(
                 _prediction_candidates(predictor, x, y),
                 x,
@@ -549,9 +561,10 @@ def segment_with_sam2(
                 )
 
             primary, primary_score = initial
+            prim_time = time.monotonic() - t_prim
             _logger.info(
-                "segment_with_sam2: primary mask score=%.3f area=%dpx",
-                float(primary_score), int(primary.sum()),
+                "segment_with_sam2: primary mask score=%.3f area=%dpx in %.3fs",
+                float(primary_score), int(primary.sum()), prim_time,
             )
 
             # Jitter points by a few source pixels to stabilize uncertain
@@ -571,6 +584,7 @@ def segment_with_sam2(
             selected = [primary]
             selected_scores = [primary_score]
 
+            t_jitter = time.monotonic()
             for jx, jy in point_specs:
                 candidates = _prediction_candidates(
                     predictor,
@@ -598,6 +612,8 @@ def segment_with_sam2(
                         "segment_with_sam2: jitter point (%d,%d) rejected (no match)",
                         jx, jy,
                     )
+            jitter_time = time.monotonic() - t_jitter
+            _logger.info("segment_with_sam2: jitter predictions done in %.3fs (%d points)", jitter_time, len(point_specs))
 
     except Sam2UnavailableError:
         raise
@@ -689,6 +705,12 @@ def segment_with_sam2(
             exc,
         )
 
+    total_time = time.monotonic() - t_start
+    _logger.info(
+        "segment_with_sam2: done in %.3fs total (load=%.3fs embed=%.3fs primary=%.3fs jitter=%.3fs)",
+        total_time, load_time, embed_time, prim_time, jitter_time,
+    )
+
     return SegmentationResult(
         mask=mask.astype(bool),
         method=(
@@ -706,7 +728,8 @@ def segment_with_sam2(
         notes=[
             (
                 f"SAM 2 model={_PREDICTOR_MODEL_ID}; "
-                f"device={_PREDICTOR_DEVICE}"
+                f"device={_PREDICTOR_DEVICE}; "
+                f"total_time={total_time:.3f}s"
             ),
             (
                 f"point ({x},{y}); "

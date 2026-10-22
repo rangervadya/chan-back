@@ -6,6 +6,8 @@ explicit fallback and is reported as such.
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 try:
@@ -76,6 +78,7 @@ class Sam2LocalBackend(BaseBackend):
             request.object_name, bool(getattr(request, "patina", False)),
             bool(getattr(request, "from_pipette", False)),
         )
+        t_sam = time.monotonic()
         try:
             seg = segment_with_sam2(
                 image, request.point_x, request.point_y,
@@ -93,6 +96,8 @@ class Sam2LocalBackend(BaseBackend):
                 type(exc).__name__, exc,
             )
             return self._local_fallback(request, image, diag, f"{type(exc).__name__}: {exc}")
+        sam_time = time.monotonic() - t_sam
+        logger.info("sam2-local: SAM 2 segmentation done in %.3fs", sam_time)
 
         mask = ops.to_mask_array(seg.mask)
         if not mask.any():
@@ -111,7 +116,10 @@ class Sam2LocalBackend(BaseBackend):
             seg.method, 100.0 * float(mask.mean()), float(seg.confidence),
         )
 
+        t_recolor = time.monotonic()
         out = recolor(image, mask, request, feather_px=_cfg("MASK_FEATHER_PX", 2.0))
+        recolor_time = time.monotonic() - t_recolor
+        logger.info("sam2-local: local recolor done in %.3fs", recolor_time)
         diag.capture("04_model_output", out, note="локальная перекраска по SAM 2 маске")
         diag.capture("05_detail_restored", out, note="исходная яркость и текстура сохранены")
         diag.capture("06_final", out, note="итоговая локальная перекраска")
@@ -122,7 +130,7 @@ class Sam2LocalBackend(BaseBackend):
             *seg.notes,
         ]
         _append_diag_note(notes, summary)
-        logger.info("sam2-local: done — backend=%s", self.name)
+        logger.info("sam2-local: done — backend=%s total=%.3fs", self.name, time.monotonic() - t_sam - recolor_time + sam_time + recolor_time)
         return BackendResult(
             image_rgb=out, backend=self.name, segmentation=seg,
             object_label=request.object_name or "selected object", notes=notes,
@@ -131,15 +139,19 @@ class Sam2LocalBackend(BaseBackend):
     def _local_fallback(self, request: RecolorRequest, image: np.ndarray,
                         diag: DiagnosticCollector, sam2_error: str) -> BackendResult:
         """Fallback to the local GrabCut segmenter when SAM 2 cannot be used."""
+        t_start = time.monotonic()
         from .segmentation import segment_object
         from .local_recolor import recolor
 
+        t_seg = time.monotonic()
         seg = segment_object(
             image, request.point_x, request.point_y,
             feather_px=_cfg("MASK_FEATHER_PX", 2.0),
             min_area_ratio=_cfg("MIN_MASK_AREA_RATIO", 0.001),
             max_area_ratio=_cfg("MAX_MASK_AREA_RATIO", 0.75),
         )
+        seg_time = time.monotonic() - t_seg
+        logger.info("sam2-local fallback: local segment done in %.3fs", seg_time)
         mask = ops.to_mask_array(seg.mask)
         if not mask.any():
             logger.warning(
@@ -172,7 +184,10 @@ class Sam2LocalBackend(BaseBackend):
             seg.method, 100.0 * float(mask.mean()), float(seg.confidence),
         )
 
+        t_recolor = time.monotonic()
         out = recolor(image, mask, request, feather_px=_cfg("MASK_FEATHER_PX", 2.0))
+        recolor_time = time.monotonic() - t_recolor
+        logger.info("sam2-local fallback: local recolor done in %.3fs", recolor_time)
         diag.capture("04_model_output", out, note="локальная перекраска по fallback маске")
         diag.capture("05_detail_restored", out, note="исходная яркость и текстура сохранены")
         diag.capture("06_final", out, note="итоговая локальная перекраска (fallback)")
@@ -184,7 +199,7 @@ class Sam2LocalBackend(BaseBackend):
             *seg.notes,
         ]
         _append_diag_note(notes, summary)
-        logger.info("sam2-local: done via fallback — backend=%s", self.name)
+        logger.info("sam2-local: done via fallback — backend=%s total=%.3fs", self.name, time.monotonic() - t_start)
         return BackendResult(
             image_rgb=out, backend="sam2-local->local-fallback", segmentation=seg,
             object_label=request.object_name or "selected object", notes=notes,
@@ -204,15 +219,20 @@ class LocalBackend(BaseBackend):
             image.shape[1], image.shape[0], request.point_x, request.point_y,
             request.material, request.target_rgb,
         )
+        t_seg = time.monotonic()
         seg = self._segment(request)
+        seg_time = time.monotonic() - t_seg
+        logger.info("local: segmentation done in %.3fs method=%s mask_area=%.2f%%",
+                    seg_time, seg.method, 100.0 * float(ops.to_mask_array(seg.mask).mean()))
         mask = ops.to_mask_array(seg.mask)
         _capture_segmentation(diag, image, seg)
         crop = _crop_for_diag(image, mask)
         diag.capture("03_crop", crop, note="crop вокруг выбранного объекта")
         diag.metric("crop_size", list(crop.shape[:2]))
-        logger.info("local: segmentation done — method=%s mask_area=%.2f%%",
-                    seg.method, 100.0 * float(mask.mean()))
+        t_recolor = time.monotonic()
         out = recolor(image, mask, request, feather_px=_cfg("MASK_FEATHER_PX", 2.0))
+        recolor_time = time.monotonic() - t_recolor
+        logger.info("local: recolor done in %.3fs", recolor_time)
         diag.capture("04_model_output", out, note="local recolor result")
         diag.capture("05_detail_restored", out, note="local recolor result")
         diag.capture("06_final", out, note="final local recolor")
@@ -220,7 +240,7 @@ class LocalBackend(BaseBackend):
         summary = diag.flush()
         notes = ["локальная перекраска внутри маски"]
         _append_diag_note(notes, summary)
-        logger.info("local: done — backend=%s", self.name)
+        logger.info("local: done — backend=%s total=%.3fs", self.name, seg_time + recolor_time)
         return BackendResult(image_rgb=out, backend=self.name, segmentation=seg,
                              object_label=request.object_name, notes=notes)
 
@@ -255,6 +275,7 @@ class CloudflareBackend(_AnalyzingMixin):
         self.analyzer_name = "cloudflare-vision"
 
     def run(self, request: RecolorRequest) -> BackendResult:
+        t_start = time.monotonic()
         diag = _diag or DiagnosticCollector(request_id_from_env())
         image = np.asarray(request.image_rgb, dtype=np.uint8)
         diag.capture("00_original_resized", image,
@@ -269,24 +290,31 @@ class CloudflareBackend(_AnalyzingMixin):
         )
         bbox = None
         detected_label = ""
+        det_time = 0.0
+        desc_time = 0.0
         detector = getattr(self.client, "detect_object", None)
         if _cfg("CLOUDFLARE_DETECTION_ENABLED", True) and callable(detector):
+            t_det = time.monotonic()
             try:
                 detection = detector(image, request.point_x, request.point_y)
+                det_time = time.monotonic() - t_det
                 if detection:
                     bbox, detected_label, score = detection
                     diag.metric("detected_object", detected_label)
                     diag.metric("detected_object_score", round(float(score), 4))
                     diag.metric("detected_object_bbox", list(bbox))
                     logger.info(
-                        "cloudflare: DETR detection label=%s score=%.3f bbox=%s",
-                        detected_label, float(score), list(bbox),
+                        "cloudflare: DETR detection label=%s score=%.3f bbox=%s in %.3fs",
+                        detected_label, float(score), list(bbox), det_time,
                     )
             except Exception as exc:  # Detection improves segmentation but isn't image generation.
                 logger.warning("Cloudflare DETR detection unavailable; using point segmentation: %s", exc)
                 diag.metric("object_detection_error", type(exc).__name__)
 
+        t_seg = time.monotonic()
         seg = self._segment(request, bbox=bbox)
+        seg_time = time.monotonic() - t_seg
+        logger.info("cloudflare: local segment done in %.3fs method=%s", seg_time, seg.method)
         mask = ops.to_mask_array(seg.mask)
         _capture_segmentation(diag, image, seg)
         if not mask.any():
@@ -299,7 +327,10 @@ class CloudflareBackend(_AnalyzingMixin):
             label = detected_label
             notes = [f"Cloudflare DETR: объект «{label}» (bbox подсказка для сегментации)"]
         else:
+            t_desc = time.monotonic()
             label, notes = self._describe(request)
+            desc_time = time.monotonic() - t_desc
+            logger.info("cloudflare: vision describe done in %.3fs label=%r", desc_time, label)
         prompt = build_recolor_prompt(request, label, _color_name(request))
         model_choice = str(_cfg("CLOUDFLARE_RECOLOR_MODEL", "klein")).strip().lower()
         if model_choice not in {"klein", "inpaint"}:
@@ -316,6 +347,7 @@ class CloudflareBackend(_AnalyzingMixin):
                     label, _color_name(request), prompt)
         notes.append(f"prompt: {prompt}")
 
+        t_gen = time.monotonic()
         try:
             painted = self._generate_recolor(
                 request, mask, prompt, model_choice,
@@ -328,6 +360,8 @@ class CloudflareBackend(_AnalyzingMixin):
                 notes.append("Включён явный CLOUDFLARE_ALLOW_LOCAL_FALLBACK; возвращаю локальную перекраску")
                 return self._local_finish(request, seg, notes, object_label=label, fallback=True, diag=diag)
             raise
+        gen_time = time.monotonic() - t_gen
+        logger.info("cloudflare: generation done in %.3fs", gen_time)
 
         diag.capture("03_crop", _crop_for_diag(image, mask), note="crop вокруг выбранного объекта")
         diag.metric("crop_size", list(_crop_for_diag(image, mask).shape[:2]))
@@ -343,13 +377,18 @@ class CloudflareBackend(_AnalyzingMixin):
             target_rgb=request.target_rgb, material=request.material,
             feather_px=_cfg("MASK_FEATHER_PX", 2.0),
         )
+        finish_time = time.monotonic() - t_gen - gen_time
         diag.capture("05_detail_restored", out, note="после восстановления деталей и коррекции цвета")
         diag.capture("06_final", out, note="итог после композиции по маске")
         _record_quality_metrics(diag, out, image, mask, request.target_rgb)
         summary = diag.flush()
         _append_diag_note(notes, summary)
         notes.append(f"генеративная перекраска: {model_choice} ({model_name or 'model name unavailable'})")
-        logger.info("cloudflare: done — backend=%s", self.name)
+        logger.info(
+            "cloudflare: done — backend=%s total=%.3fs (det=%.3fs seg=%.3fs desc=%.3fs gen=%.3fs finish=%.3fs)",
+            self.name, time.monotonic() - t_start,
+            det_time, seg_time, desc_time, gen_time, finish_time,
+        )
         return BackendResult(image_rgb=out, backend=self.name, segmentation=seg,
                              object_label=label, notes=notes)
 
@@ -362,6 +401,7 @@ class CloudflareBackend(_AnalyzingMixin):
         last: Exception | None = None
         for attempt in range(attempts):
             seed = int(np.random.default_rng(attempt).integers(1, 2**31 - 1))
+            t_attempt = time.monotonic()
             try:
                 if recolor_model == "inpaint":
                     painted = self.client.inpaint(
@@ -396,6 +436,8 @@ class CloudflareBackend(_AnalyzingMixin):
                     request.material, residual_threshold=0.62,
                 )
             if issue is None:
+                logger.info("cloudflare: %s attempt %d/%d ok in %.3fs",
+                            recolor_model, attempt + 1, attempts, time.monotonic() - t_attempt)
                 return np.clip(np.asarray(painted), 0, 255).astype(np.uint8)
             last = CloudflareAIError(issue, status=0)
             logger.warning("Cloudflare %s attempt %d/%d rejected: %s", recolor_model, attempt + 1, attempts, issue)
@@ -410,8 +452,10 @@ class CloudflareBackend(_AnalyzingMixin):
                       notes: list[str], object_label: str = "", fallback: bool = False,
                       diag: DiagnosticCollector | None = None) -> BackendResult:
         from .local_recolor import recolor
+        t0 = time.monotonic()
         out = recolor(request.image_rgb, seg.mask, request,
                       feather_px=_cfg("MASK_FEATHER_PX", 2.0))
+        logger.info("cloudflare: local finish recolor done in %.3fs", time.monotonic() - t0)
         if fallback:
             notes.append("ВНИМАНИЕ: генеративная модель не сработала; использована локальная перекраска")
         else:
@@ -439,21 +483,30 @@ class GeminiBackend(_AnalyzingMixin):
         self.analyzer_name = "gemini"
 
     def run(self, request: RecolorRequest) -> BackendResult:
+        t_start = time.monotonic()
         image = np.asarray(request.image_rgb, dtype=np.uint8)
         logger.info(
             "gemini backend: image=%dx%d point=(%.1f,%.1f) material=%s target_rgb=%s",
             image.shape[1], image.shape[0], request.point_x, request.point_y,
             request.material, request.target_rgb,
         )
+        t_seg = time.monotonic()
         seg = self._segment(request)
+        seg_time = time.monotonic() - t_seg
+        t_desc = time.monotonic()
         label, notes = self._describe(request)
-        logger.info("gemini: segmentation done — method=%s mask_area=%.2f%% label=%s",
-                    seg.method, 100.0 * float(ops.to_mask_array(seg.mask).mean()), label)
+        desc_time = time.monotonic() - t_desc
+        logger.info("gemini: segmentation done in %.3fs method=%s mask_area=%.2f%% label=%r",
+                    seg_time, seg.method, 100.0 * float(ops.to_mask_array(seg.mask).mean()), label)
         from .local_recolor import recolor
+        t_recolor = time.monotonic()
         out = recolor(request.image_rgb, seg.mask, request,
                       feather_px=_cfg("MASK_FEATHER_PX", 2.0))
+        recolor_time = time.monotonic() - t_recolor
         if request.from_pipette:
             out = _match_mean(out, seg.mask, request.target_rgb)
+        logger.info("gemini: done — backend=%s total=%.3fs (seg=%.3fs desc=%.3fs recolor=%.3fs)",
+                    self.name, time.monotonic() - t_start, seg_time, desc_time, recolor_time)
         return BackendResult(image_rgb=out, backend=self.name, segmentation=seg,
                              object_label=label, notes=notes + ["перекраска локальным алгоритмом"])
 
@@ -468,9 +521,10 @@ class ZaiBackend(BaseBackend):
         from .segmentation import segment_object
         box = None
         if getattr(self.client, "is_available", True):
+            t_box = time.monotonic()
             try:
                 box = self.client.object_box(request.image_rgb, request.point_x, request.point_y)
-                logger.info("zai: object_box returned bbox=%s", box)
+                logger.info("zai: object_box returned bbox=%s in %.3fs", box, time.monotonic() - t_box)
             except Exception as exc:  # noqa: BLE001
                 logger.info("Z.AI недоступен -> локальная сегментация: %s", exc)
         return segment_object(
@@ -481,21 +535,28 @@ class ZaiBackend(BaseBackend):
         )
 
     def run(self, request: RecolorRequest) -> BackendResult:
+        t_start = time.monotonic()
         image = np.asarray(request.image_rgb, dtype=np.uint8)
         logger.info(
             "zai backend: image=%dx%d point=(%.1f,%.1f) material=%s target_rgb=%s",
             image.shape[1], image.shape[0], request.point_x, request.point_y,
             request.material, request.target_rgb,
         )
+        t_seg = time.monotonic()
         seg = self._segment(request)
+        seg_time = time.monotonic() - t_seg
         from .local_recolor import recolor
+        t_recolor = time.monotonic()
         out = recolor(request.image_rgb, seg.mask, request,
                       feather_px=_cfg("MASK_FEATHER_PX", 2.0))
+        recolor_time = time.monotonic() - t_recolor
         if request.from_pipette:
             out = _match_mean(out, seg.mask, request.target_rgb)
         notes = [n for n in seg.notes if n.startswith("box-") or "bbox" in n or "маску" in n]
         if self.client is not None and not getattr(self.client, "is_configured", False):
             notes.append("Z.AI не сконфигурирован -> локальная сегментация")
+        logger.info("zai: done — backend=%s total=%.3fs (seg=%.3fs recolor=%.3fs)",
+                    self.name, time.monotonic() - t_start, seg_time, recolor_time)
         return BackendResult(image_rgb=out, backend=self.name, segmentation=seg,
                              object_label=request.object_name, notes=notes)
 

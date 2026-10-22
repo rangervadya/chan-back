@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import base64
+import time
 
 import numpy as np
 
@@ -73,6 +74,7 @@ class GeminiAI:
         return f"Gemini error (HTTP {resp.status_code})"
 
     def describe(self, image_rgb: np.ndarray, point_x: float, point_y: float) -> str:
+        t0 = time.monotonic()
         img = np.asarray(image_rgb, dtype=np.uint8)
         h, w = img.shape[:2]
         x = int(np.clip(round(point_x), 0, w - 1))
@@ -102,7 +104,9 @@ class GeminiAI:
         text = text.strip().strip("```").strip()
         if "\n" in text:
             text = text.splitlines()[0]
-        return text.strip()
+        label = text.strip()
+        logger.info("gemini: describe done in %.2fs label=%r", time.monotonic() - t0, label)
+        return label
 
     @staticmethod
     def _encode_png(image: np.ndarray) -> str:

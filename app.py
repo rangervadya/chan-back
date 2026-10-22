@@ -713,6 +713,7 @@ async def ai_recolor(
         from recolor.base import RecolorRequest
 
         # Декодируем и ресайзим до максимального размера инференса.
+        t_decode = time.monotonic()
         try:
             source_image = Image.open(BytesIO(img_bytes))
             source_image = ImageOps.exif_transpose(source_image).convert("RGB")
@@ -728,9 +729,10 @@ async def ai_recolor(
         sy = (nh / oh) if oh else 1.0
         point_x = int(point_x * sx)
         point_y = int(point_y * sy)
+        decode_time = time.monotonic() - t_decode
         logger.info(
-            "   Image decoded: %dx%d -> %dx%d (scale %.3fx) point=(%d,%d)",
-            ow, oh, nw, nh, sx, point_x, point_y,
+            "   Image decoded: %dx%d -> %dx%d (scale %.3fx) point=(%d,%d) in %.3fs",
+            ow, oh, nw, nh, sx, point_x, point_y, decode_time,
         )
 
         color_hex_int = parse_rgb_color(color_hex)
@@ -759,7 +761,10 @@ async def ai_recolor(
 
         backend = get_backend()
         logger.info(f"▶ Using backend: {backend.name}")
+        t_backend = time.monotonic()
         result = backend.run(request)
+        backend_time = time.monotonic() - t_backend
+        logger.info("   Backend %s run done in %.3fs", backend.name, backend_time)
 
         result_image = np.asarray(result.image_rgb, dtype=np.uint8)
         if result_image.size == 0 or result_image.shape[0] == 0 or result_image.shape[1] == 0:
@@ -773,14 +778,18 @@ async def ai_recolor(
             )
 
         out_img = Image.fromarray(result_image)
+        t_encode = time.monotonic()
         buf = BytesIO()
         out_img.save(buf, format="PNG")
         buf.seek(0)
         response_content = buf.getvalue()
+        encode_time = time.monotonic() - t_encode
         logger.info(
-            "✅ Request completed in %.2fs total — backend=%s output=%dx%d bytes=%d",
+            "✅ Request completed in %.2fs total — backend=%s output=%dx%d bytes=%d "
+            "(decode=%.3fs backend=%.3fs encode=%.3fs)",
             time.time() - start_time, result.backend,
             out_img.width, out_img.height, len(response_content),
+            decode_time, backend_time, encode_time,
         )
     except HTTPException:
         raise

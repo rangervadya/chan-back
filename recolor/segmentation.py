@@ -16,6 +16,8 @@ and colour-flood fallback keep it from over-growing on uniform frames.
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 try:
@@ -38,6 +40,7 @@ def segment_object(image_rgb: np.ndarray, point_x: float, point_y: float,
                    seed_rect: tuple[int, int, int, int] | None = None
                    ) -> SegmentationResult:
     """Return a point-selected object mask."""
+    t_start = time.monotonic()
     image = np.asarray(image_rgb, dtype=np.uint8)
     if image.ndim != 3 or image.shape[2] != 3 or image.size == 0:
         raise ValueError("image_rgb must be a non-empty HxWx3 RGB array")
@@ -52,6 +55,7 @@ def segment_object(image_rgb: np.ndarray, point_x: float, point_y: float,
         w, h, x, y, bbox, seed_rect, min_area_ratio, max_area_ratio,
     )
 
+    t_seg = time.monotonic()
     if cv2 is None:
         mask = _color_region(image, x, y, bbox)
         method = "color-flood"
@@ -92,6 +96,8 @@ def segment_object(image_rgb: np.ndarray, point_x: float, point_y: float,
             mask = _grabcut_seed(image, x, y)
             method = "grabcut"
             logger.info("segment: no bbox -> point-seeded grabcut")
+    seg_time = time.monotonic() - t_seg
+    logger.info("segment: initial %s in %.3fs", method, seg_time)
 
     mask = ops.to_mask_array(mask)
 
@@ -111,11 +117,15 @@ def segment_object(image_rgb: np.ndarray, point_x: float, point_y: float,
         area_ratio = float(mask.mean())
         notes.append(f"area capped to largest component ({area_ratio * 100:.1f}%)")
 
+    t_clean = time.monotonic()
     mask = ops.morphological_cleanup(mask, close_kernel=3, open_kernel=0, fill_holes=False)
     if not mask[y, x] and mask.any():
         mask = ops.dilate_mask(mask, 1)
     mask = ops.morphological_cleanup(mask, close_kernel=3, open_kernel=0, fill_holes=True)
+    clean_time = time.monotonic() - t_clean
+    logger.info("segment: morphological cleanup in %.3fs", clean_time)
 
+    t_flood = time.monotonic()
     flood_mask = _flood_reconcile(image, x, y, mask)
     if flood_mask is not None:
         notes.append("flood-fill reconciliation refined the selection")
@@ -126,6 +136,8 @@ def segment_object(image_rgb: np.ndarray, point_x: float, point_y: float,
         logger.info("segment: flood-fill reconciliation applied (mask now %.2f%%)", 100.0 * float(mask.mean()))
     else:
         logger.info("segment: flood-fill reconciliation skipped (no improvement)")
+    flood_time = time.monotonic() - t_flood
+    logger.info("segment: flood reconciliation in %.3fs", flood_time)
 
     if not mask.any() or float(mask.mean()) < min_area_ratio:
         logger.warning(
@@ -139,10 +151,15 @@ def segment_object(image_rgb: np.ndarray, point_x: float, point_y: float,
             notes=notes + ["маска пуста после очистки"],
         )
 
+    t_conf = time.monotonic()
     confidence = _confidence(image, mask, x, y)
+    conf_time = time.monotonic() - t_conf
+    total_time = time.monotonic() - t_start
     logger.info(
-        "segment: done — method=%s mask_area=%.2f%% confidence=%.3f notes=%s",
+        "segment: done — method=%s mask_area=%.2f%% confidence=%.3f notes=%s "
+        "times: seg=%.3fs clean=%.3fs flood=%.3fs conf=%.3fs total=%.3fs",
         method, 100.0 * float(mask.mean()), float(confidence), notes,
+        seg_time, clean_time, flood_time, conf_time, total_time,
     )
     return SegmentationResult(
         mask=mask.astype(bool), method=method,
@@ -151,6 +168,7 @@ def segment_object(image_rgb: np.ndarray, point_x: float, point_y: float,
         notes=notes + [
             f"point ({x},{y}); mask area={float(mask.mean()) * 100:.2f}%",
             f"seed region area={area_ratio * 100:.2f}%",
+            f"segment times: seg={seg_time:.3f}s clean={clean_time:.3f}s flood={flood_time:.3f}s conf={conf_time:.3f}s total={total_time:.3f}s",
         ],
     )
 

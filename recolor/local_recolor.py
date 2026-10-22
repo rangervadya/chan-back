@@ -1,6 +1,8 @@
 """Deterministic recoloring fallback for Camelion (RGB uint8, OpenCV LAB)."""
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 try:
@@ -32,6 +34,7 @@ _TEXTURE_KEEP = {
 def recolor(image_rgb: np.ndarray, mask: np.ndarray, request: RecolorRequest,
             feather_px: float = 2.0) -> np.ndarray:
     """Recolor the selected mask, keeping luminance relief and replacing hue."""
+    t_start = time.monotonic()
     if cv2 is None:
         raise RuntimeError("opencv-python-headless is required for recoloring")
     src = np.asarray(image_rgb, dtype=np.uint8)
@@ -90,6 +93,7 @@ def recolor(image_rgb: np.ndarray, mask: np.ndarray, request: RecolorRequest,
     )
 
     # Material-specific light response. All effects are luminance-only.
+    t_effects = time.monotonic()
     out_lab = np.clip(out_lab, 0, 255)
     if material in ("metal", "bronze"):
         _apply_metal_shading(out_lab, m, lab[m], request)
@@ -112,7 +116,10 @@ def recolor(image_rgb: np.ndarray, mask: np.ndarray, request: RecolorRequest,
         # Tint the whole selected glass surface. Its transparency/shine is
         # represented by retained luminance; do not retain the old hue.
         logger.info("recolor: glass material — no extra luminance effect applied")
+    effects_time = time.monotonic() - t_effects
+    logger.info("recolor: material effects done in %.3fs", effects_time)
 
+    t_convert = time.monotonic()
     rgb = cv2.cvtColor(np.clip(out_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
     rgb = _match_target_mean(rgb.astype(np.float32), m, target)
     rgb = np.clip(rgb, 0, 255).astype(np.uint8)
@@ -125,9 +132,11 @@ def recolor(image_rgb: np.ndarray, mask: np.ndarray, request: RecolorRequest,
     soft[~m] = 0.0
     result = (rgb.astype(np.float32) * soft[..., None] +
               src.astype(np.float32) * (1.0 - soft[..., None]))
+    convert_time = time.monotonic() - t_convert
+    logger.info("recolor: convert+feather done in %.3fs", convert_time)
     logger.info(
-        "recolor: done — mean_rgb_in_mask=%s final_feather_px=%.1f",
-        ops.mean_rgb(result, m).tolist(), float(feather_px),
+        "recolor: done — mean_rgb_in_mask=%s final_feather_px=%.1f total=%.3fs",
+        ops.mean_rgb(result, m).tolist(), float(feather_px), time.monotonic() - t_start,
     )
     return np.clip(result, 0, 255).astype(np.uint8)
 

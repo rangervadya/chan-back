@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import os
 import struct
+import time
 from typing import Any
 
 import numpy as np
@@ -186,12 +187,14 @@ class CloudflareAI:
             headers["Content-Type"] = "application/octet-stream"
         attempt = 0
         last: Exception | None = None
+        t0 = time.monotonic()
         while True:
             try:
                 resp = self._session().post(url, headers=headers, json=payload, timeout=self.timeout)
             except Exception as exc:  # noqa: BLE001
                 last = exc
                 if attempt >= self.max_retries:
+                    logger.warning("cloudflare: %s network error after %.2fs: %s", model, time.monotonic() - t0, exc)
                     raise CloudflareAIError(f"network error calling {model}: {exc}", status=0, retryable=True) from exc
                 attempt += 1
                 continue
@@ -203,20 +206,24 @@ class CloudflareAI:
                         return resp.content
                     raise CloudflareAIError(f"invalid response from {model}", status=502, retryable=True)
                 if body.get("success", True) and not body.get("errors"):
+                    logger.info("cloudflare: %s ok in %.2fs", model, time.monotonic() - t0)
                     return body.get("result", body)
                 message, retryable = _parse_error(resp)
                 err = CloudflareAIError(message, status=resp.status_code, retryable=retryable)
                 if not retryable or attempt >= self.max_retries:
+                    logger.warning("cloudflare: %s error in %.2fs: %s", model, time.monotonic() - t0, err)
                     raise err
                 attempt += 1
                 continue
             if resp.status_code in {429}:
                 _, retryable = _parse_error(resp)
                 err = CloudflareAIError(_parse_error(resp)[0], status=429, retryable=False)
+                logger.warning("cloudflare: %s 429 in %.2fs", model, time.monotonic() - t0)
                 raise err
             message, retryable = _parse_error(resp)
             err = CloudflareAIError(message, status=resp.status_code, retryable=retryable)
             if not retryable or attempt >= self.max_retries:
+                logger.warning("cloudflare: %s error in %.2fs: %s", model, time.monotonic() - t0, err)
                 raise err
             attempt += 1
             continue
@@ -231,6 +238,7 @@ class CloudflareAI:
         headers = self._headers()
         attempt = 0
         last: Exception | None = None
+        t0 = time.monotonic()
         while True:
             try:
                 resp = self._session().post(url, headers=headers, data=data,
@@ -238,6 +246,7 @@ class CloudflareAI:
             except Exception as exc:  # noqa: BLE001
                 last = exc
                 if attempt >= self.max_retries:
+                    logger.warning("cloudflare: %s multipart network error after %.2fs: %s", model, time.monotonic() - t0, exc)
                     raise CloudflareAIError(f"network error calling {model}: {exc}", status=0, retryable=True) from exc
                 attempt += 1
                 continue
@@ -247,25 +256,30 @@ class CloudflareAI:
                 except Exception:  # noqa: BLE001
                     return resp.content
                 if body.get("success", True) and not body.get("errors"):
+                    logger.info("cloudflare: %s multipart ok in %.2fs", model, time.monotonic() - t0)
                     return body.get("result", body)
                 message, retryable = _parse_error(resp)
                 err = CloudflareAIError(message, status=resp.status_code, retryable=retryable)
                 if not retryable or attempt >= self.max_retries:
+                    logger.warning("cloudflare: %s multipart error in %.2fs: %s", model, time.monotonic() - t0, err)
                     raise err
                 attempt += 1
                 continue
             if resp.status_code in {429}:
                 err = CloudflareAIError(_parse_error(resp)[0], status=429, retryable=False)
+                logger.warning("cloudflare: %s multipart 429 in %.2fs", model, time.monotonic() - t0)
                 raise err
             message, retryable = _parse_error(resp)
             err = CloudflareAIError(message, status=resp.status_code, retryable=retryable)
             if not retryable or attempt >= self.max_retries:
+                logger.warning("cloudflare: %s multipart error in %.2fs: %s", model, time.monotonic() - t0, err)
                 raise err
             attempt += 1
             continue
 
     def describe(self, image_rgb: np.ndarray, point_x: float, point_y: float) -> str:
         """Ask the vision LLM what object the tap selects; empty string if unknown."""
+        t0 = time.monotonic()
         img = np.asarray(image_rgb, dtype=np.uint8)
         h, w = img.shape[:2]
         x = int(np.clip(round(point_x), 0, w - 1))
@@ -284,10 +298,13 @@ class CloudflareAI:
             resp = result.get("response", "")
         else:
             resp = ""
-        return _clean_label(str(resp))
+        label = _clean_label(str(resp))
+        logger.info("cloudflare: vision describe done in %.2fs label=%r", time.monotonic() - t0, label)
+        return label
 
     def detect_object(self, image_rgb: np.ndarray, point_x: float, point_y: float):
         """Return (box, label, score) for the detected object containing the tap."""
+        t0 = time.monotonic()
         if not self.detection_model:
             return None
         img = np.asarray(image_rgb, dtype=np.uint8)
@@ -330,11 +347,13 @@ class CloudflareAI:
                     _clean_label(str(label)),
                     score,
                 )
+        logger.info("cloudflare: DETR detect_object done in %.2fs best=%s", time.monotonic() - t0, best)
         return best
 
     def recolor_klein(self, image_rgb: np.ndarray, mask: np.ndarray, prompt: str,
                       size: int = 1024, seed: int | None = None) -> np.ndarray:
         """FLUX.2 [klein] 4B guided edit: send image+mask+prompt, return RGB."""
+        t0 = time.monotonic()
         if not self.klein_model:
             raise CloudflareAIError(
                 "CLOUDFLARE_KLEIN_MODEL is not configured; cannot run FLUX.2 [klein]. "
@@ -370,13 +389,16 @@ class CloudflareAI:
             "mask": ("mask.png", mask_bytes, "image/png"),
         }
         result = self._run_multipart(self.klein_model, fields, files)
-        return _decode_image_result(result, img.shape)
+        out = _decode_image_result(result, img.shape)
+        logger.info("cloudflare: klein recolor done in %.2fs (model=%s)", time.monotonic() - t0, self.klein_model)
+        return out
 
     def inpaint(self, image_rgb: np.ndarray, mask: np.ndarray, prompt: str,
                 negative_prompt: str = "", strength: float = 0.82,
                 num_steps: int = 20, guidance: float = 7.5,
                 size: int = 1024, seed: int | None = None) -> np.ndarray:
         """SD-1.5 inpainting: image+mask as byte arrays per the live API contract."""
+        t0 = time.monotonic()
         if not self.inpaint_model:
             raise CloudflareAIError(
                 "CLOUDFLARE_INPAINT_MODEL is not configured; cannot run inpaint.",
@@ -404,10 +426,13 @@ class CloudflareAI:
             "seed": seed or 0,
         }
         result = self._run(self.inpaint_model, payload)
-        return _decode_image_result(result, img.shape)
+        out = _decode_image_result(result, img.shape)
+        logger.info("cloudflare: inpaint done in %.2fs (model=%s)", time.monotonic() - t0, self.inpaint_model)
+        return out
 
     def _raw_post(self, model: str, blob: bytes) -> Any:
         """Post raw binary (image) to a model endpoint, e.g. DETR detection."""
+        t0 = time.monotonic()
         url = f"{self.base_url}/run/{model}"
         headers = self._headers()
         headers["Content-Type"] = "image/png"
@@ -417,6 +442,7 @@ class CloudflareAI:
                 resp = self._session().post(url, headers=headers, data=blob, timeout=self.timeout)
             except Exception as exc:  # noqa: BLE001
                 if attempt >= self.max_retries:
+                    logger.warning("cloudflare: %s raw network error after %.2fs: %s", model, time.monotonic() - t0, exc)
                     raise CloudflareAIError(f"network error calling {model}: {exc}", status=0, retryable=True) from exc
                 attempt += 1
                 continue
@@ -424,18 +450,22 @@ class CloudflareAI:
                 try:
                     body = resp.json()
                 except Exception:  # noqa: BLE001
+                    logger.info("cloudflare: %s raw ok in %.2fs (binary)", model, time.monotonic() - t0)
                     return resp.content
                 if body.get("success", True) and not body.get("errors"):
+                    logger.info("cloudflare: %s raw ok in %.2fs", model, time.monotonic() - t0)
                     return body.get("result", body)
                 message, retryable = _parse_error(resp)
                 err = CloudflareAIError(message, status=resp.status_code, retryable=retryable)
                 if not retryable or attempt >= self.max_retries:
+                    logger.warning("cloudflare: %s raw error in %.2fs: %s", model, time.monotonic() - t0, err)
                     raise err
                 attempt += 1
                 continue
             message, retryable = _parse_error(resp)
             err = CloudflareAIError(message, status=resp.status_code, retryable=retryable)
             if not retryable or attempt >= self.max_retries:
+                logger.warning("cloudflare: %s raw error in %.2fs: %s", model, time.monotonic() - t0, err)
                 raise err
             attempt += 1
             continue
