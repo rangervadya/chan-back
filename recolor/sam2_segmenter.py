@@ -634,19 +634,37 @@ def segment_with_sam2(
         and iou >= 0.70
     ):
         mask = consensus
+        mask_source = "consensus"
     else:
         mask = primary
+        mask_source = "primary"
+    _logger.info(
+        "segment_with_sam2: mask selection — masks=%d primary_area=%d consensus_area=%d "
+        "iou=%.3f selected=%s",
+        len(selected), primary_area, consensus_area, iou, mask_source,
+    )
 
     # Reject implausible masks rather than recolouring the wrong object.
     area_ratio = float(mask.mean())
 
     if not mask[y, x]:
+        _logger.warning(
+            "segment_with_sam2: mask does not include selected pixel (%d,%d) — "
+            "primary_area=%d consensus_area=%d iou=%.3f",
+            x, y, primary_area, consensus_area, iou,
+        )
         raise Sam2UnavailableError(
             "SAM 2 mask did not include the selected pixel; "
             "please tap the object again"
         )
 
     if area_ratio < 0.0005 or area_ratio > 0.78:
+        _logger.warning(
+            "segment_with_sam2: implausible mask area=%.4f (%.1f%% of image) — "
+            "primary_area=%d consensus_area=%d iou=%.3f masks=%d",
+            area_ratio, area_ratio * 100.0, primary_area, consensus_area, iou,
+            len(selected),
+        )
         raise Sam2UnavailableError(
             "SAM 2 produced an implausible object mask "
             f"({area_ratio * 100:.1f}% of image); "

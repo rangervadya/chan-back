@@ -761,7 +761,18 @@ async def ai_recolor(
         logger.info(f"▶ Using backend: {backend.name}")
         result = backend.run(request)
 
-        out_img = Image.fromarray(np.asarray(result.image_rgb, dtype=np.uint8))
+        result_image = np.asarray(result.image_rgb, dtype=np.uint8)
+        if result_image.size == 0 or result_image.shape[0] == 0 or result_image.shape[1] == 0:
+            logger.error(
+                "Backend %s returned empty image (backend=%s notes=%s)",
+                backend.name, result.backend, result.notes,
+            )
+            raise HTTPException(
+                500,
+                "Backend returned an empty result; check server logs for segmentation errors.",
+            )
+
+        out_img = Image.fromarray(result_image)
         buf = BytesIO()
         out_img.save(buf, format="PNG")
         buf.seek(0)
@@ -784,9 +795,14 @@ async def ai_recolor(
         from recolor.cloudflare_ai import CloudflareAIError
         from recolor.sam2_segmenter import Sam2UnavailableError
         if isinstance(e, BackendConfigurationError):
+            logger.error("Backend configuration error: %s", e)
             raise HTTPException(503, str(e)) from e
         if isinstance(e, Sam2UnavailableError):
-            logger.error("SAM 2 recolor request could not be completed: %s", e)
+            logger.error(
+                "SAM 2 recolor request could not be completed: %s "
+                "(check SAM 2 model download/cache, server RAM, and server logs)",
+                e,
+            )
             raise HTTPException(
                 503,
                 "Object segmentation is temporarily unavailable. Check SAM 2 model download/cache, server RAM, and server logs.",
@@ -796,6 +812,7 @@ async def ai_recolor(
             status = 503 if e.status == 429 else 502
             detail = "Image generation service failed. Check Cloudflare credentials, model access, quota, and server logs."
             raise HTTPException(status, detail) from e
+        logger.error("Unhandled exception type=%s: %s", type(e).__name__, e)
         raise HTTPException(500, "Image processing failed; check server logs.") from e
 
     total_time = time.time() - start_time

@@ -53,6 +53,10 @@ class Sam2LocalBackend(BaseBackend):
     It intentionally does not call an image-generation API. Pixels outside the
     selected object mask remain the original pixels, while the target hue is
     changed locally and the photograph's luminance/texture is retained.
+
+    When SAM 2 fails (model missing, empty mask, implausible mask area, inference
+    error) the backend falls back to the local GrabCut segmenter so the request
+    still produces a recoloured image instead of a hard 503.
     """
     name = "sam2-local"
 
@@ -77,14 +81,23 @@ class Sam2LocalBackend(BaseBackend):
                 image, request.point_x, request.point_y,
                 model_name=_cfg("SAM2_MODEL_NAME", "facebook/sam2.1-hiera-base-plus"),
             )
-        except Sam2UnavailableError:
-            raise
+        except Sam2UnavailableError as exc:
+            logger.warning(
+                "sam2-local: SAM 2 segmentation failed (%s); falling back to local GrabCut segmenter",
+                exc,
+            )
+            return self._local_fallback(request, image, diag, str(exc))
         except Exception as exc:  # noqa: BLE001
-            raise Sam2UnavailableError(f"SAM 2 segmentation failed: {type(exc).__name__}: {exc}") from exc
+            logger.warning(
+                "sam2-local: SAM 2 unexpected error (%s: %s); falling back to local GrabCut segmenter",
+                type(exc).__name__, exc,
+            )
+            return self._local_fallback(request, image, diag, f"{type(exc).__name__}: {exc}")
 
         mask = ops.to_mask_array(seg.mask)
         if not mask.any():
-            raise Sam2UnavailableError("SAM 2 returned an empty object mask")
+            logger.warning("sam2-local: SAM 2 returned empty mask; falling back to local GrabCut segmenter")
+            return self._local_fallback(request, image, diag, "SAM 2 returned an empty object mask")
         _capture_segmentation(diag, image, seg)
         crop = _crop_for_diag(image, mask)
         diag.capture("03_crop", crop, note="выделенный SAM 2 объект")
@@ -112,6 +125,68 @@ class Sam2LocalBackend(BaseBackend):
         logger.info("sam2-local: done — backend=%s", self.name)
         return BackendResult(
             image_rgb=out, backend=self.name, segmentation=seg,
+            object_label=request.object_name or "selected object", notes=notes,
+        )
+
+    def _local_fallback(self, request: RecolorRequest, image: np.ndarray,
+                        diag: DiagnosticCollector, sam2_error: str) -> BackendResult:
+        """Fallback to the local GrabCut segmenter when SAM 2 cannot be used."""
+        from .segmentation import segment_object
+        from .local_recolor import recolor
+
+        seg = segment_object(
+            image, request.point_x, request.point_y,
+            feather_px=_cfg("MASK_FEATHER_PX", 2.0),
+            min_area_ratio=_cfg("MIN_MASK_AREA_RATIO", 0.001),
+            max_area_ratio=_cfg("MAX_MASK_AREA_RATIO", 0.75),
+        )
+        mask = ops.to_mask_array(seg.mask)
+        if not mask.any():
+            logger.warning(
+                "sam2-local fallback: local segmenter also returned empty mask; "
+                "returning original image unchanged (error was: %s)",
+                sam2_error,
+            )
+            diag.capture("06_final", image, note="итог: исходное изображение (сегментация не удалась)")
+            summary = diag.flush()
+            notes = [
+                f"SAM 2 fallback: {sam2_error}",
+                "Fallback: локальная сегментация тоже не выделила объект — возвращено исходное изображение",
+                *seg.notes,
+            ]
+            _append_diag_note(notes, summary)
+            return BackendResult(
+                image_rgb=image.copy(), backend="sam2-local->local-fallback-empty",
+                segmentation=seg, object_label=request.object_name or "selected object",
+                notes=notes,
+            )
+        _capture_segmentation(diag, image, seg)
+        crop = _crop_for_diag(image, mask)
+        diag.capture("03_crop", crop, note="объект выделен локальным segment_object (fallback)")
+        diag.metric("crop_size", list(crop.shape[:2]))
+        diag.metric("segmentation_method", seg.method)
+        diag.metric("segmentation_confidence", round(float(seg.confidence), 4))
+        diag.metric("mask_area_ratio", round(float(mask.mean()), 5))
+        logger.info(
+            "sam2-local fallback: segmentation done — method=%s mask_area=%.2f%% confidence=%.3f",
+            seg.method, 100.0 * float(mask.mean()), float(seg.confidence),
+        )
+
+        out = recolor(image, mask, request, feather_px=_cfg("MASK_FEATHER_PX", 2.0))
+        diag.capture("04_model_output", out, note="локальная перекраска по fallback маске")
+        diag.capture("05_detail_restored", out, note="исходная яркость и текстура сохранены")
+        diag.capture("06_final", out, note="итоговая локальная перекраска (fallback)")
+        _record_quality_metrics(diag, out, image, mask, request.target_rgb)
+        summary = diag.flush()
+        notes = [
+            f"SAM 2 fallback: {sam2_error}",
+            "Fallback: локальная сегментация (GrabCut) + локальный цветовой преобразование",
+            *seg.notes,
+        ]
+        _append_diag_note(notes, summary)
+        logger.info("sam2-local: done via fallback — backend=%s", self.name)
+        return BackendResult(
+            image_rgb=out, backend="sam2-local->local-fallback", segmentation=seg,
             object_label=request.object_name or "selected object", notes=notes,
         )
 
