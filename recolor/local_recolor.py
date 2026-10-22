@@ -8,8 +8,11 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None
 
+from logger import get_logger
 from . import ops
 from .base import RecolorRequest
+
+logger = get_logger(__name__)
 
 _FLAT_MATERIALS = {"no_texture"}
 _LIGHT_KEEP = {
@@ -48,6 +51,14 @@ def recolor(image_rgb: np.ndarray, mask: np.ndarray, request: RecolorRequest,
     l_mean = float(region[:, 0].mean())
     material = (request.material or "wood").lower()
 
+    logger.info(
+        "recolor: image=%dx%d mask_pixels=%d (%.2f%%) material=%s target_rgb=%s "
+        "target_lab=%s region_l_mean=%.1f feather_px=%.1f patina=%s from_pipette=%s",
+        src.shape[1], src.shape[0], int(m.sum()), 100.0 * float(m.mean()),
+        material, target, target_lab.tolist(), l_mean, float(feather_px),
+        bool(getattr(request, "patina", False)), bool(getattr(request, "from_pipette", False)),
+    )
+
     # Retain real luminance structure (shadows, folds, reflections) rather
     # than synthesizing arbitrary noise over the photograph.
     l_keep = _LIGHT_KEEP.get(material, 0.85)
@@ -55,6 +66,11 @@ def recolor(image_rgb: np.ndarray, mask: np.ndarray, request: RecolorRequest,
         out_lab[m, 0] = target_lab[0] + (region[:, 0] - l_mean) * 0.20
     else:
         out_lab[m, 0] = target_lab[0] + (region[:, 0] - l_mean) * l_keep
+
+    logger.info(
+        "recolor: luminance channel set target_L=%.1f l_keep=%.2f (material=%s)",
+        float(target_lab[0]), l_keep, material,
+    )
 
     # Establish the chosen colour first; retain a restrained portion of local
     # chroma variation for believable texture without old-colour blotches.
@@ -67,24 +83,35 @@ def recolor(image_rgb: np.ndarray, mask: np.ndarray, request: RecolorRequest,
             deviation = region[:, c] - float(region[:, c].mean())
             out_lab[m, c] = target_lab[c] + deviation * keep
 
+    logger.info(
+        "recolor: chroma channels set target_ab=%s texture_keep=%s (material=%s)",
+        target_lab[1:].tolist(), _TEXTURE_KEEP.get(material, 0.18) if material not in _FLAT_MATERIALS else "flat",
+        material,
+    )
+
     # Material-specific light response. All effects are luminance-only.
     out_lab = np.clip(out_lab, 0, 255)
     if material in ("metal", "bronze"):
         _apply_metal_shading(out_lab, m, lab[m], request)
+        logger.info("recolor: applied metal shading (material=%s)", material)
     elif material == "wood":
         _blend_luminance_noise(out_lab, m, amount=2.2, cell=max(5, min(src.shape[:2]) // 100), seed=11)
+        logger.info("recolor: applied wood grain luminance noise")
     elif material == "fabric":
         _blend_luminance_weave(out_lab, m, amount=1.2, spacing=max(4, min(src.shape[:2]) // 160))
+        logger.info("recolor: applied fabric weave luminance")
     elif material in ("leather", "concrete"):
         _blend_luminance_noise(out_lab, m, amount=1.4 if material == "leather" else 1.8,
                                cell=5 if material == "leather" else 3,
                                seed=31 if material == "leather" else 23)
+        logger.info("recolor: applied %s luminance noise", material)
     elif material in ("plastic", "ceramic"):
         _blend_luminance_gradient(out_lab, m, amount=1.0 if material == "plastic" else 0.7)
+        logger.info("recolor: applied %s luminance gradient", material)
     elif material == "glass":
         # Tint the whole selected glass surface. Its transparency/shine is
         # represented by retained luminance; do not retain the old hue.
-        pass
+        logger.info("recolor: glass material — no extra luminance effect applied")
 
     rgb = cv2.cvtColor(np.clip(out_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
     rgb = _match_target_mean(rgb.astype(np.float32), m, target)
@@ -98,6 +125,10 @@ def recolor(image_rgb: np.ndarray, mask: np.ndarray, request: RecolorRequest,
     soft[~m] = 0.0
     result = (rgb.astype(np.float32) * soft[..., None] +
               src.astype(np.float32) * (1.0 - soft[..., None]))
+    logger.info(
+        "recolor: done — mean_rgb_in_mask=%s final_feather_px=%.1f",
+        ops.mean_rgb(result, m).tolist(), float(feather_px),
+    )
     return np.clip(result, 0, 255).astype(np.uint8)
 
 

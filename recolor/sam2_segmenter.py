@@ -118,9 +118,15 @@ def _resolve_model(
         (model_path_or_huggingface_repo_id, local_files_only)
     """
     local_path = os.getenv("SAM2_LOCAL_MODEL_PATH", "").strip()
+    _logger.info(
+        "_resolve_model: requested=%s SAM2_LOCAL_MODEL_PATH=%s SAM2_MODEL_NAME=%s SAM2_LOCAL_FILES_ONLY=%s",
+        requested, local_path, os.getenv("SAM2_MODEL_NAME", DEFAULT_MODEL),
+        os.getenv("SAM2_LOCAL_FILES_ONLY", "0"),
+    )
 
     # Prefer the explicitly configured local model directory.
     if local_path and os.path.isdir(local_path):
+        _logger.info("_resolve_model: using local model dir=%s (local_files_only=True)", local_path)
         return local_path, True
 
     if local_path:
@@ -162,6 +168,7 @@ def _resolve_model(
         in {"1", "true", "yes", "on"}
     )
 
+    _logger.info("_resolve_model: resolved=%s local_files_only=%s", resolved, local_files_only)
     return resolved, local_files_only
 
 
@@ -292,6 +299,7 @@ def _get_predictor(model_name: str | None = None) -> Any:
         _PREDICTOR is not None
         and _PREDICTOR_MODEL_ID == requested
     ):
+        _logger.info("_get_predictor: cached predictor reused (model=%s)", requested)
         return _PREDICTOR
 
     with _LOCK:
@@ -300,6 +308,7 @@ def _get_predictor(model_name: str | None = None) -> Any:
             _PREDICTOR is not None
             and _PREDICTOR_MODEL_ID == requested
         ):
+            _logger.info("_get_predictor: cached predictor reused (model=%s)", requested)
             return _PREDICTOR
 
         try:
@@ -324,12 +333,15 @@ def _get_predictor(model_name: str | None = None) -> Any:
         except Exception:
             device = "cpu"
 
+        _logger.info("_get_predictor: loading model=%s device=%s threads=%d", requested, device, threads)
+
         try:
             if os.path.isdir(requested):
                 predictor = _load_local_predictor(requested, device)
             else:
                 # This branch is used only when a local directory is not
                 # selected and the resolved model is a Hugging Face model ID.
+                _logger.info("_get_predictor: loading from HuggingFace repo=%s", requested)
                 predictor = SAM2ImagePredictor.from_pretrained(
                     requested,
                     device=device,
@@ -511,6 +523,11 @@ def segment_with_sam2(
     x = int(np.clip(round(point_x), 0, w - 1))
     y = int(np.clip(round(point_y), 0, h - 1))
 
+    _logger.info(
+        "segment_with_sam2: image=%dx%d point=(%d,%d) model_name=%s",
+        w, h, x, y, model_name,
+    )
+
     predictor = _get_predictor(model_name)
 
     try:
@@ -518,6 +535,7 @@ def segment_with_sam2(
 
         with torch.inference_mode():
             predictor.set_image(image)
+            _logger.info("segment_with_sam2: image embedding set")
 
             initial = _select_candidate(
                 _prediction_candidates(predictor, x, y),
@@ -531,6 +549,10 @@ def segment_with_sam2(
                 )
 
             primary, primary_score = initial
+            _logger.info(
+                "segment_with_sam2: primary mask score=%.3f area=%dpx",
+                float(primary_score), int(primary.sum()),
+            )
 
             # Jitter points by a few source pixels to stabilize uncertain
             # boundaries. The image embedding is reused between predictions.
@@ -567,6 +589,15 @@ def segment_with_sam2(
                     candidate, score = chosen
                     selected.append(candidate)
                     selected_scores.append(score)
+                    _logger.info(
+                        "segment_with_sam2: jitter point (%d,%d) score=%.3f area=%dpx",
+                        jx, jy, float(score), int(candidate.sum()),
+                    )
+                else:
+                    _logger.info(
+                        "segment_with_sam2: jitter point (%d,%d) rejected (no match)",
+                        jx, jy,
+                    )
 
     except Sam2UnavailableError:
         raise

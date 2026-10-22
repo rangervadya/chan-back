@@ -64,6 +64,14 @@ class Sam2LocalBackend(BaseBackend):
         image = np.asarray(request.image_rgb, dtype=np.uint8)
         diag.capture("00_original_resized", image,
                      note=f"исходная фотография ({image.shape[1]}x{image.shape[0]})")
+        logger.info(
+            "sam2-local backend: image=%dx%d point=(%.1f,%.1f) material=%s "
+            "target_rgb=%s hex_color=%s object_name=%s patina=%s from_pipette=%s",
+            image.shape[1], image.shape[0], request.point_x, request.point_y,
+            request.material, request.target_rgb, getattr(request, "hex_color", ""),
+            request.object_name, bool(getattr(request, "patina", False)),
+            bool(getattr(request, "from_pipette", False)),
+        )
         try:
             seg = segment_with_sam2(
                 image, request.point_x, request.point_y,
@@ -85,6 +93,11 @@ class Sam2LocalBackend(BaseBackend):
         diag.metric("segmentation_confidence", round(float(seg.confidence), 4))
         diag.metric("mask_area_ratio", round(float(mask.mean()), 5))
 
+        logger.info(
+            "sam2-local: segmentation done — method=%s mask_area=%.2f%% confidence=%.3f",
+            seg.method, 100.0 * float(mask.mean()), float(seg.confidence),
+        )
+
         out = recolor(image, mask, request, feather_px=_cfg("MASK_FEATHER_PX", 2.0))
         diag.capture("04_model_output", out, note="локальная перекраска по SAM 2 маске")
         diag.capture("05_detail_restored", out, note="исходная яркость и текстура сохранены")
@@ -96,6 +109,7 @@ class Sam2LocalBackend(BaseBackend):
             *seg.notes,
         ]
         _append_diag_note(notes, summary)
+        logger.info("sam2-local: done — backend=%s", self.name)
         return BackendResult(
             image_rgb=out, backend=self.name, segmentation=seg,
             object_label=request.object_name or "selected object", notes=notes,
@@ -110,12 +124,19 @@ class LocalBackend(BaseBackend):
         diag = _diag or DiagnosticCollector(request_id_from_env())
         image = request.image_rgb
         diag.capture("00_original_resized", image, note=f"original {image.shape[1]}x{image.shape[0]}")
+        logger.info(
+            "local backend: image=%dx%d point=(%.1f,%.1f) material=%s target_rgb=%s",
+            image.shape[1], image.shape[0], request.point_x, request.point_y,
+            request.material, request.target_rgb,
+        )
         seg = self._segment(request)
         mask = ops.to_mask_array(seg.mask)
         _capture_segmentation(diag, image, seg)
         crop = _crop_for_diag(image, mask)
         diag.capture("03_crop", crop, note="crop вокруг выбранного объекта")
         diag.metric("crop_size", list(crop.shape[:2]))
+        logger.info("local: segmentation done — method=%s mask_area=%.2f%%",
+                    seg.method, 100.0 * float(mask.mean()))
         out = recolor(image, mask, request, feather_px=_cfg("MASK_FEATHER_PX", 2.0))
         diag.capture("04_model_output", out, note="local recolor result")
         diag.capture("05_detail_restored", out, note="local recolor result")
@@ -124,6 +145,7 @@ class LocalBackend(BaseBackend):
         summary = diag.flush()
         notes = ["локальная перекраска внутри маски"]
         _append_diag_note(notes, summary)
+        logger.info("local: done — backend=%s", self.name)
         return BackendResult(image_rgb=out, backend=self.name, segmentation=seg,
                              object_label=request.object_name, notes=notes)
 
@@ -162,6 +184,14 @@ class CloudflareBackend(_AnalyzingMixin):
         image = np.asarray(request.image_rgb, dtype=np.uint8)
         diag.capture("00_original_resized", image,
                      note=f"исходная фотография ({image.shape[1]}x{image.shape[0]})")
+        logger.info(
+            "cloudflare backend: image=%dx%d point=(%.1f,%.1f) material=%s "
+            "target_rgb=%s hex_color=%s object_name=%s patina=%s from_pipette=%s",
+            image.shape[1], image.shape[0], request.point_x, request.point_y,
+            request.material, request.target_rgb, getattr(request, "hex_color", ""),
+            request.object_name, bool(getattr(request, "patina", False)),
+            bool(getattr(request, "from_pipette", False)),
+        )
         bbox = None
         detected_label = ""
         detector = getattr(self.client, "detect_object", None)
@@ -173,6 +203,10 @@ class CloudflareBackend(_AnalyzingMixin):
                     diag.metric("detected_object", detected_label)
                     diag.metric("detected_object_score", round(float(score), 4))
                     diag.metric("detected_object_bbox", list(bbox))
+                    logger.info(
+                        "cloudflare: DETR detection label=%s score=%.3f bbox=%s",
+                        detected_label, float(score), list(bbox),
+                    )
             except Exception as exc:  # Detection improves segmentation but isn't image generation.
                 logger.warning("Cloudflare DETR detection unavailable; using point segmentation: %s", exc)
                 diag.metric("object_detection_error", type(exc).__name__)
@@ -203,6 +237,8 @@ class CloudflareBackend(_AnalyzingMixin):
         diag.metric("prompt", prompt)
         logger.info("Cloudflare generation: backend=%s model=%s mask=%.2f%%",
                     model_choice, model_name, float(mask.mean()) * 100)
+        logger.info("cloudflare: prompt built — label=%s color_name=%s prompt=%s",
+                    label, _color_name(request), prompt)
         notes.append(f"prompt: {prompt}")
 
         try:
@@ -238,6 +274,7 @@ class CloudflareBackend(_AnalyzingMixin):
         summary = diag.flush()
         _append_diag_note(notes, summary)
         notes.append(f"генеративная перекраска: {model_choice} ({model_name or 'model name unavailable'})")
+        logger.info("cloudflare: done — backend=%s", self.name)
         return BackendResult(image_rgb=out, backend=self.name, segmentation=seg,
                              object_label=label, notes=notes)
 
@@ -327,8 +364,16 @@ class GeminiBackend(_AnalyzingMixin):
         self.analyzer_name = "gemini"
 
     def run(self, request: RecolorRequest) -> BackendResult:
+        image = np.asarray(request.image_rgb, dtype=np.uint8)
+        logger.info(
+            "gemini backend: image=%dx%d point=(%.1f,%.1f) material=%s target_rgb=%s",
+            image.shape[1], image.shape[0], request.point_x, request.point_y,
+            request.material, request.target_rgb,
+        )
         seg = self._segment(request)
         label, notes = self._describe(request)
+        logger.info("gemini: segmentation done — method=%s mask_area=%.2f%% label=%s",
+                    seg.method, 100.0 * float(ops.to_mask_array(seg.mask).mean()), label)
         from .local_recolor import recolor
         out = recolor(request.image_rgb, seg.mask, request,
                       feather_px=_cfg("MASK_FEATHER_PX", 2.0))
@@ -350,6 +395,7 @@ class ZaiBackend(BaseBackend):
         if getattr(self.client, "is_available", True):
             try:
                 box = self.client.object_box(request.image_rgb, request.point_x, request.point_y)
+                logger.info("zai: object_box returned bbox=%s", box)
             except Exception as exc:  # noqa: BLE001
                 logger.info("Z.AI недоступен -> локальная сегментация: %s", exc)
         return segment_object(
@@ -360,6 +406,12 @@ class ZaiBackend(BaseBackend):
         )
 
     def run(self, request: RecolorRequest) -> BackendResult:
+        image = np.asarray(request.image_rgb, dtype=np.uint8)
+        logger.info(
+            "zai backend: image=%dx%d point=(%.1f,%.1f) material=%s target_rgb=%s",
+            image.shape[1], image.shape[0], request.point_x, request.point_y,
+            request.material, request.target_rgb,
+        )
         seg = self._segment(request)
         from .local_recolor import recolor
         out = recolor(request.image_rgb, seg.mask, request,
@@ -390,6 +442,7 @@ _BACKENDS = {"local": LocalBackend, "cloudflare": CloudflareBackend,
 def get_backend(name: str | None = None):
     import config
     chosen = (name or getattr(config, "AI_BACKEND", "auto") or "auto").strip().lower()
+    logger.info("get_backend: requested=%s resolved=%s", name, chosen)
     if chosen == "legacy":
         from app import run_legacy_recolor_job
         return LegacyBackend(run_legacy_recolor_job)
@@ -421,6 +474,8 @@ def _build_cloudflare(required: bool):
     import config
     account_id = getattr(config, "CLOUDFLARE_ACCOUNT_ID", "")
     token = getattr(config, "CLOUDFLARE_API_TOKEN", "")
+    logger.info("_build_cloudflare: account_id=%s token_present=%s required=%s",
+                account_id, bool(token), required)
     if not (account_id and token):
         if required:
             raise BackendConfigurationError("AI_BACKEND=cloudflare, но не заданы CLOUDFLARE_ACCOUNT_ID и/или CLOUDFLARE_API_TOKEN")
@@ -443,6 +498,7 @@ def _build_cloudflare(required: bool):
 def _build_zai(required: bool):
     import config
     api_key = getattr(config, "ZAI_API_KEY", "")
+    logger.info("_build_zai: api_key_present=%s required=%s", bool(api_key), required)
     if not api_key:
         if required:
             raise RuntimeError("AI_BACKEND=zai, но не задан ZAI_API_KEY")
@@ -459,6 +515,7 @@ def _build_zai(required: bool):
 def _build_gemini(required: bool):
     import config
     api_key = getattr(config, "GEMINI_API_KEY", "")
+    logger.info("_build_gemini: api_key_present=%s required=%s", bool(api_key), required)
     if not api_key:
         if required:
             raise RuntimeError("AI_BACKEND=gemini, но не задан GEMINI_API_KEY")
@@ -478,11 +535,15 @@ def _cfg(name: str, default):
 
 def _color_name(request: RecolorRequest) -> str:
     if getattr(request, "color_name", ""):
+        logger.info("_color_name: using provided color_name=%s", request.color_name)
         return request.color_name
     try:
         from config import get_color_hex_name
-        return get_color_hex_name(request.color_hex)
+        name = get_color_hex_name(request.color_hex)
+        logger.info("_color_name: resolved from hex %s -> %s", hex(request.color_hex), name)
+        return name
     except Exception:
+        logger.warning("_color_name: failed to resolve name for hex=%s", hex(request.color_hex))
         return ""
 
 
@@ -521,6 +582,11 @@ def build_recolor_prompt(request: RecolorRequest, object_label: str, color_name:
         prompt += ", aged patina with subtle natural oxidation"
     if material == "glass":
         prompt += " Tint the complete visible glass body including side walls, rim and base, not just the bottom; keep the hand, background seen through the glass, and surroundings unchanged."
+    logger.info(
+        "build_recolor_prompt: material=%s key=%s color=%s object_label=%s "
+        "color_name=%s completeness=%s prompt_len=%d",
+        material, key, color, object_label, color_name, completeness, len(prompt),
+    )
     return prompt
 
 

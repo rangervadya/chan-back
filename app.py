@@ -292,6 +292,7 @@ async def health():
         backend = get_backend()
     except BackendConfigurationError as exc:
         # A deployment without provider credentials is not ready to accept work.
+        logger.warning("health: backend not configured — %s", exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     generation_enabled = backend.name in {"cloudflare", "legacy"}
     model_info = {"loaded": _predictor is not None and _pipe is not None,
@@ -299,6 +300,11 @@ async def health():
     if backend.name == "sam2-local":
         from recolor.sam2_segmenter import loaded_model_info
         model_info = loaded_model_info()
+    logger.info(
+        "health: backend=%s generation_enabled=%s device=%s models_loaded=%s segmentation_model=%s",
+        backend.name, generation_enabled, model_info.get("device") or _device,
+        bool(model_info.get("loaded")), model_info.get("model"),
+    )
     return {
         "status": "healthy",
         "device": model_info.get("device") or _device,
@@ -650,11 +656,16 @@ async def ai_recolor(
     logger.info("📥 ===== NEW REQUEST =====")
     logger.info("   Client IP: %s", client_ip)
     logger.info("   X-API-Key header present: %s", has_api_key)
-    logger.debug(f"   Filename: {image.filename}")
-    logger.debug(f"   point_x: {point_x}, point_y: {point_y}")
-    logger.debug(f"   object_name: {object_name}, material: {material}, color_hex: {color_hex}, color_name: {color_name}, color_rgb: ({color_r}, {color_g}, {color_b}), strength: {strength}, guidance_scale: {guidance_scale}, steps: {num_inference_steps}, patina: {patina}")
+    logger.info(
+        "   Request params: point_x=%s point_y=%s material=%s color_hex=%s color_name=%s "
+        "color_rgb=(%s,%s,%s) object_name=%s strength=%s guidance_scale=%s "
+        "steps=%s patina=%s from_pipette=%s",
+        point_x, point_y, material, color_hex, color_name,
+        color_r, color_g, color_b, object_name, strength, guidance_scale,
+        num_inference_steps, patina, from_pipette,
+    )
 
-    # --- Валидация входящих параметров (защита от аномальных значений/DoS) ---
+    # --- Валидация входящих параметов (защита от аномальных значений/DoS) ---
     for _name, _val in (
         ("point_x", point_x), ("point_y", point_y),
         ("strength", strength), ("guidance_scale", guidance_scale),
@@ -717,8 +728,16 @@ async def ai_recolor(
         sy = (nh / oh) if oh else 1.0
         point_x = int(point_x * sx)
         point_y = int(point_y * sy)
+        logger.info(
+            "   Image decoded: %dx%d -> %dx%d (scale %.3fx) point=(%d,%d)",
+            ow, oh, nw, nh, sx, point_x, point_y,
+        )
 
         color_hex_int = parse_rgb_color(color_hex)
+        logger.info(
+            "   Color: hex=%s -> int=%d (0x%06X) rgb=(%s,%s,%s) name=%s",
+            color_hex, color_hex_int, color_hex_int, color_r, color_g, color_b, color_name,
+        )
 
         request = RecolorRequest(
             image_rgb=np.array(source_image),
@@ -747,6 +766,11 @@ async def ai_recolor(
         out_img.save(buf, format="PNG")
         buf.seek(0)
         response_content = buf.getvalue()
+        logger.info(
+            "✅ Request completed in %.2fs total — backend=%s output=%dx%d bytes=%d",
+            time.time() - start_time, result.backend,
+            out_img.width, out_img.height, len(response_content),
+        )
     except HTTPException:
         raise
     except Exception as e:

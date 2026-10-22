@@ -23,8 +23,11 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None
 
+from logger import get_logger
 from .base import SegmentationResult
 from . import ops
+
+logger = get_logger(__name__)
 
 
 def segment_object(image_rgb: np.ndarray, point_x: float, point_y: float,
@@ -43,15 +46,23 @@ def segment_object(image_rgb: np.ndarray, point_x: float, point_y: float,
     y = int(np.clip(round(point_y), 0, h - 1))
     notes: list[str] = []
 
+    logger.info(
+        "segment: image=%dx%d point=(%d,%d) bbox=%s seed_rect=%s "
+        "min_area_ratio=%.4f max_area_ratio=%.2f",
+        w, h, x, y, bbox, seed_rect, min_area_ratio, max_area_ratio,
+    )
+
     if cv2 is None:
         mask = _color_region(image, x, y, bbox)
         method = "color-flood"
         notes.append("fallback: OpenCV недоступен")
+        logger.warning("segment: OpenCV unavailable, using color-flood fallback")
     else:
         if _is_flat(image):
             mask = _flat_region(x, y, h, w)
             method = "flat"
             notes.append("flat image -> fixed radius around point")
+            logger.info("segment: flat image detected (std<4.0) -> fixed radius mask")
         elif bbox is not None:
             bx1, by1, bx2, by2 = bbox
             bx0 = max(0, min(int(bx1), w))
@@ -66,12 +77,21 @@ def segment_object(image_rgb: np.ndarray, point_x: float, point_y: float,
                 mask = _grabcut_seed(image, x, y)
                 method = "grabcut"
                 notes.append("inflated bbox ignored -> point seeding")
+                logger.info(
+                    "segment: bbox too large (%.1f%% of frame) -> point-seeded grabcut",
+                    100.0 * box_area / max(w * h, 1),
+                )
             else:
                 mask = _grabcut_in_box(image, x, y, bbox)
                 method = "grabcut"
+                logger.info(
+                    "segment: bbox=%s (%.1f%% of frame) -> grabcut-in-box",
+                    bbox, 100.0 * box_area / max(w * h, 1),
+                )
         else:
             mask = _grabcut_seed(image, x, y)
             method = "grabcut"
+            logger.info("segment: no bbox -> point-seeded grabcut")
 
     mask = ops.to_mask_array(mask)
 
@@ -103,8 +123,15 @@ def segment_object(image_rgb: np.ndarray, point_x: float, point_y: float,
         if not mask[y, x] and mask.any():
             mask = ops.dilate_mask(mask, 1)
         mask = ops.morphological_cleanup(mask, close_kernel=3, open_kernel=0, fill_holes=True)
+        logger.info("segment: flood-fill reconciliation applied (mask now %.2f%%)", 100.0 * float(mask.mean()))
+    else:
+        logger.info("segment: flood-fill reconciliation skipped (no improvement)")
 
     if not mask.any() or float(mask.mean()) < min_area_ratio:
+        logger.warning(
+            "segment: mask empty or below min_area_ratio=%.4f (area=%.4f) -> returning empty",
+            min_area_ratio, float(mask.mean()),
+        )
         return SegmentationResult(
             mask=np.zeros((h, w), bool), method=method,
             area_ratio=0.0, confidence=0.0,
@@ -113,6 +140,10 @@ def segment_object(image_rgb: np.ndarray, point_x: float, point_y: float,
         )
 
     confidence = _confidence(image, mask, x, y)
+    logger.info(
+        "segment: done — method=%s mask_area=%.2f%% confidence=%.3f notes=%s",
+        method, 100.0 * float(mask.mean()), float(confidence), notes,
+    )
     return SegmentationResult(
         mask=mask.astype(bool), method=method,
         area_ratio=float(mask.mean()), confidence=float(np.clip(confidence, 0.0, 1.0)),
