@@ -83,8 +83,16 @@ class Sam2LocalBackend(BaseBackend):
             seg = segment_with_sam2(
                 image, request.point_x, request.point_y,
                 model_name=_cfg("SAM2_MODEL_NAME", "facebook/sam2.1-hiera-base-plus"),
+                negative_points=getattr(request, "negative_points", []),
             )
         except Sam2UnavailableError as exc:
+            if getattr(request, "negative_points", []):
+                # GrabCut cannot honour SAM 2 negative clicks. A fallback here
+                # could recolour the very details the user explicitly protected.
+                raise Sam2UnavailableError(
+                    "SAM 2 failed while protected details were specified; "
+                    "unsafe fallback was cancelled. Retry or remove protection points."
+                ) from exc
             logger.warning(
                 "sam2-local: SAM 2 segmentation failed (%s); falling back to local GrabCut segmenter",
                 exc,
@@ -304,6 +312,7 @@ class CloudflareBackend(_AnalyzingMixin):
                     "SAM2_MODEL_NAME",
                     "facebook/sam2.1-hiera-base-plus",
                 ),
+                negative_points=getattr(request, "negative_points", []),
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception(
@@ -390,7 +399,8 @@ class CloudflareBackend(_AnalyzingMixin):
         out = _hybrid_finish(
             painted_ai=painted, original=image, mask=mask,
             target_rgb=request.target_rgb, material=request.material,
-            feather_px=_cfg("MASK_FEATHER_PX", 2.0),
+            feather_px=_cfg("MASK_FEATHER_PX", 2.0), request=request,
+            ai_texture_influence=float(_cfg("CLOUDFLARE_AI_TEXTURE_INFLUENCE", 0.08)),
         )
         finish_time = time.monotonic() - t_gen - gen_time
         diag.capture("05_detail_restored", out, note="после восстановления деталей и коррекции цвета")
@@ -776,9 +786,11 @@ def build_recolor_prompt(request: RecolorRequest, object_label: str, color_name:
         )
 
     prompt = (
-        "STRICT PHOTO EDIT. Use input_image_0 as the source photograph and keep it as the "
-        "same image; do not create a new scene or reinterpret the object. "
-        f"Change only the surface color of the existing {label} to {color} "
+        "STRICT PHOTO EDIT. input_image_0 is the original photograph. input_image_1 is a "
+        "binary selection map: white means the only area allowed to change, black means "
+        "preserve the original. Use input_image_0 as the source and keep the same photograph; "
+        "do not create a new scene or reinterpret the object. Change only the surface color "
+        f"inside the white selection area on the existing {label} to {color} "
         f"(HEX {hex_color}, RGB {rgb}). "
         "Preserve the exact identity, silhouette, proportions, geometry, components, joints, "
         "edges, seams, accessories, position, orientation, camera angle, and perspective. "
@@ -882,16 +894,104 @@ def _coverage_fraction_unchanged(painted: np.ndarray, original: np.ndarray,
     return float(np.mean(~changed[elig]))
 
 
-def _hybrid_finish(painted_ai: np.ndarray, original: np.ndarray, mask: np.ndarray,
-                   target_rgb: tuple[int, int, int], material: str,
-                   feather_px: float) -> np.ndarray:
-    if cv2 is None:
-        return _shift_mean_to(painted_ai, mask, target_rgb)
+def _hybrid_finish(
+    painted_ai: np.ndarray,
+    original: np.ndarray,
+    mask: np.ndarray,
+    target_rgb: tuple[int, int, int],
+    material: str,
+    feather_px: float,
+    request: RecolorRequest | None = None,
+    ai_texture_influence: float = 0.08,
+) -> np.ndarray:
+    """Recolor only selected pixels while preserving source geometry and relief.
+
+    Cloudflare FLUX.2 Klein is a reference-image generator, not a masked
+    inpainting endpoint. Its full RGB output can redraw lettering, cameras,
+    seams or product geometry. The final result therefore starts from the
+    original photo: source luminance is kept, only LAB chroma is shifted toward
+    the requested color, and FLUX may contribute a very small low-frequency
+    chroma variation. Pixels outside the binary SAM 2 mask are copied exactly.
+    """
     m = ops.to_mask_array(mask)
+    src = np.asarray(original, dtype=np.uint8)
     if not m.any():
-        return original.copy()
-    detail = _restore_detail(painted_ai, original, m, feather_px, amount=0.85)
-    return _enforce_coverage(detail, m, target_rgb, material, original=original)
+        return src.copy()
+
+    if cv2 is None:
+        # OpenCV is required by this project for production recoloring. If it
+        # is absent, prefer a source-based fallback over inserting AI geometry.
+        if request is not None:
+            from .local_recolor import recolor
+            return recolor(src, m, request, feather_px=feather_px)
+        return src.copy()
+
+    material_key = (material or "object").lower()
+    target = np.uint8([[list(tuple(int(np.clip(c, 0, 255)) for c in target_rgb))]])
+    target_lab = cv2.cvtColor(target, cv2.COLOR_RGB2LAB).astype(np.float32)[0, 0]
+    source_lab = cv2.cvtColor(src, cv2.COLOR_RGB2LAB).astype(np.float32)
+    base_lab = source_lab.copy()
+
+    # Keep original luminance exactly. Rebase only chroma on the chosen color;
+    # a small fraction of existing material chroma variation preserves natural
+    # local differences without retaining large blotches of the old hue.
+    source_chroma_keep = {
+        "metal": 0.18, "bronze": 0.18, "wood": 0.08, "leather": 0.06,
+        "fabric": 0.06, "plastic": 0.03, "glass": 0.02,
+        "ceramic": 0.03, "concrete": 0.08, "no_texture": 0.0,
+    }.get(material_key, 0.04)
+    for channel in (1, 2):
+        values = source_lab[..., channel][m]
+        median = float(np.median(values))
+        deviation = source_lab[..., channel] - median
+        if values.size:
+            q = float(np.percentile(np.abs(deviation[m]), 90))
+            if q > 0:
+                deviation = np.clip(deviation, -q, q)
+        base_lab[m, channel] = np.clip(
+            target_lab[channel] + deviation[m] * source_chroma_keep,
+            0,
+            255,
+        )
+
+    influence = float(np.clip(ai_texture_influence, 0.0, 0.20))
+    if influence > 0 and material_key != "no_texture":
+        ai = np.asarray(painted_ai, dtype=np.uint8)
+        if ai.shape != src.shape:
+            ai = cv2.resize(ai, (src.shape[1], src.shape[0]), interpolation=cv2.INTER_LINEAR)
+        ai_lab = cv2.cvtColor(ai, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+        # Only use a tiny amount of smoothed AI chroma; never take its luminance
+        # or pixel edges. This avoids importing model-created text/geometry.
+        sigma = max(2.0, min(src.shape[:2]) / 120.0)
+        ai_a = cv2.GaussianBlur(ai_lab[..., 1], (0, 0), sigmaX=sigma, sigmaY=sigma)
+        ai_b = cv2.GaussianBlur(ai_lab[..., 2], (0, 0), sigmaX=sigma, sigmaY=sigma)
+        ai_scale = {
+            "metal": 0.14, "bronze": 0.14, "wood": 0.08, "leather": 0.06,
+            "fabric": 0.06, "plastic": 0.04, "glass": 0.03,
+            "ceramic": 0.04, "concrete": 0.07,
+        }.get(material_key, 0.05) * influence / 0.08
+        for channel, smooth in ((1, ai_a), (2, ai_b)):
+            vals = smooth[m]
+            if vals.size == 0:
+                continue
+            deviation = smooth - float(np.median(vals))
+            q = float(np.percentile(np.abs(deviation[m]), 90))
+            if q > 0:
+                deviation = np.clip(deviation, -q, q)
+            base_lab[m, channel] = np.clip(
+                base_lab[m, channel] + deviation[m] * ai_scale,
+                0,
+                255,
+            )
+
+    # The L channel was copied from the original and was never changed.
+    recolored_rgb = cv2.cvtColor(
+        np.clip(base_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB
+    )
+    out = src.copy()
+    out[m] = recolored_rgb[m]
+    return out.astype(np.uint8)
 
 
 def _restore_detail(painted: np.ndarray, original: np.ndarray, mask: np.ndarray,

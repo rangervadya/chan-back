@@ -4,6 +4,7 @@ import traceback
 import gc
 import math
 import re
+import json
 import secrets
 import threading
 from collections import defaultdict, deque
@@ -648,6 +649,7 @@ async def ai_recolor(
     num_inference_steps: int = Form(FLUX_DEFAULT_NUM_INFERENCE_STEPS),
     patina: bool = Form(False),
     from_pipette: bool = Form(False),
+    negative_points: str = Form("[]"),
     api_key: str | None = Depends(verify_api_key),
 ):
     start_time = time.time()
@@ -713,7 +715,6 @@ async def ai_recolor(
         from recolor.base import RecolorRequest
 
         # Декодируем и ресайзим до максимального размера инференса.
-        t_decode = time.monotonic()
         try:
             source_image = Image.open(BytesIO(img_bytes))
             source_image = ImageOps.exif_transpose(source_image).convert("RGB")
@@ -722,6 +723,29 @@ async def ai_recolor(
         ow, oh = source_image.size
         if not (0 <= point_x < ow and 0 <= point_y < oh):
             raise HTTPException(400, "Tap point is outside the uploaded image")
+
+        # Optional negative SAM 2 points protect details such as camera lenses,
+        # a monitor display, logos, and labels. Input is JSON [[x, y], ...].
+        try:
+            parsed_negative_points = json.loads(negative_points or "[]")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise HTTPException(400, "negative_points must be a JSON array of [x, y] pairs") from exc
+        if not isinstance(parsed_negative_points, list) or len(parsed_negative_points) > 32:
+            raise HTTPException(400, "negative_points must be a list containing at most 32 points")
+        clean_negative_points: list[tuple[float, float]] = []
+        for item in parsed_negative_points:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise HTTPException(400, "Each negative point must be [x, y]")
+            try:
+                nx, ny = float(item[0]), float(item[1])
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, "Negative point coordinates must be numbers") from exc
+            if not (math.isfinite(nx) and math.isfinite(ny)):
+                raise HTTPException(400, "Negative point coordinates must be finite")
+            if not (0 <= nx < ow and 0 <= ny < oh):
+                raise HTTPException(400, "A protected point is outside the uploaded image")
+            clean_negative_points.append((nx, ny))
+
         if ow > MAX_INFERENCE_SIZE or oh > MAX_INFERENCE_SIZE:
             source_image.thumbnail((MAX_INFERENCE_SIZE, MAX_INFERENCE_SIZE))
         nw, nh = source_image.size
@@ -729,10 +753,13 @@ async def ai_recolor(
         sy = (nh / oh) if oh else 1.0
         point_x = int(point_x * sx)
         point_y = int(point_y * sy)
-        decode_time = time.monotonic() - t_decode
+        scaled_negative_points = [
+            (float(np.clip(int(nx * sx), 0, nw - 1)), float(np.clip(int(ny * sy), 0, nh - 1)))
+            for nx, ny in clean_negative_points
+        ]
         logger.info(
-            "   Image decoded: %dx%d -> %dx%d (scale %.3fx) point=(%d,%d) in %.3fs",
-            ow, oh, nw, nh, sx, point_x, point_y, decode_time,
+            "   Image decoded: %dx%d -> %dx%d (scale %.3fx) point=(%d,%d) protected_points=%d",
+            ow, oh, nw, nh, sx, point_x, point_y, len(scaled_negative_points),
         )
 
         color_hex_int = parse_rgb_color(color_hex)
@@ -757,14 +784,12 @@ async def ai_recolor(
             strength=strength,
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
+            negative_points=scaled_negative_points,
         )
 
         backend = get_backend()
         logger.info(f"▶ Using backend: {backend.name}")
-        t_backend = time.monotonic()
         result = backend.run(request)
-        backend_time = time.monotonic() - t_backend
-        logger.info("   Backend %s run done in %.3fs", backend.name, backend_time)
 
         result_image = np.asarray(result.image_rgb, dtype=np.uint8)
         if result_image.size == 0 or result_image.shape[0] == 0 or result_image.shape[1] == 0:
@@ -778,18 +803,14 @@ async def ai_recolor(
             )
 
         out_img = Image.fromarray(result_image)
-        t_encode = time.monotonic()
         buf = BytesIO()
         out_img.save(buf, format="PNG")
         buf.seek(0)
         response_content = buf.getvalue()
-        encode_time = time.monotonic() - t_encode
         logger.info(
-            "✅ Request completed in %.2fs total — backend=%s output=%dx%d bytes=%d "
-            "(decode=%.3fs backend=%.3fs encode=%.3fs)",
+            "✅ Request completed in %.2fs total — backend=%s output=%dx%d bytes=%d",
             time.time() - start_time, result.backend,
             out_img.width, out_img.height, len(response_content),
-            decode_time, backend_time, encode_time,
         )
     except HTTPException:
         raise

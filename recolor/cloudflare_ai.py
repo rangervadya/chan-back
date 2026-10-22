@@ -14,7 +14,6 @@ from __future__ import annotations
 import io
 import os
 import struct
-import time
 from typing import Any
 
 import numpy as np
@@ -130,13 +129,20 @@ def _resize_with_ratio(image: np.ndarray, size: int) -> tuple[bytes, tuple[int, 
 
 
 def _mask_to_png_bytes(mask: np.ndarray) -> bytes:
+    """Encode a binary mask as a real black/white RGB reference image."""
     m = np.asarray(mask)
-    if m.dtype != np.uint8:
+    if m.dtype != np.uint8 or (m.size and int(m.max()) <= 1):
         m = (m > 0).astype(np.uint8) * 255
-    if m.ndim == 2:
-        m = np.stack([m] * 3, axis=-1)
+    else:
+        m = np.clip(m, 0, 255).astype(np.uint8)
+    if m.ndim == 3 and m.shape[2] == 3:
+        gray = m
+    else:
+        if m.ndim == 3:
+            m = m[..., 0]
+        gray = np.repeat(m[..., None], 3, axis=-1)
     buf = io.BytesIO()
-    Image.fromarray(m).save(buf, format="PNG")
+    Image.fromarray(gray, mode="RGB").save(buf, format="PNG")
     return buf.getvalue()
 
 
@@ -187,14 +193,12 @@ class CloudflareAI:
             headers["Content-Type"] = "application/octet-stream"
         attempt = 0
         last: Exception | None = None
-        t0 = time.monotonic()
         while True:
             try:
                 resp = self._session().post(url, headers=headers, json=payload, timeout=self.timeout)
             except Exception as exc:  # noqa: BLE001
                 last = exc
                 if attempt >= self.max_retries:
-                    logger.warning("cloudflare: %s network error after %.2fs: %s", model, time.monotonic() - t0, exc)
                     raise CloudflareAIError(f"network error calling {model}: {exc}", status=0, retryable=True) from exc
                 attempt += 1
                 continue
@@ -206,24 +210,20 @@ class CloudflareAI:
                         return resp.content
                     raise CloudflareAIError(f"invalid response from {model}", status=502, retryable=True)
                 if body.get("success", True) and not body.get("errors"):
-                    logger.info("cloudflare: %s ok in %.2fs", model, time.monotonic() - t0)
                     return body.get("result", body)
                 message, retryable = _parse_error(resp)
                 err = CloudflareAIError(message, status=resp.status_code, retryable=retryable)
                 if not retryable or attempt >= self.max_retries:
-                    logger.warning("cloudflare: %s error in %.2fs: %s", model, time.monotonic() - t0, err)
                     raise err
                 attempt += 1
                 continue
             if resp.status_code in {429}:
                 _, retryable = _parse_error(resp)
                 err = CloudflareAIError(_parse_error(resp)[0], status=429, retryable=False)
-                logger.warning("cloudflare: %s 429 in %.2fs", model, time.monotonic() - t0)
                 raise err
             message, retryable = _parse_error(resp)
             err = CloudflareAIError(message, status=resp.status_code, retryable=retryable)
             if not retryable or attempt >= self.max_retries:
-                logger.warning("cloudflare: %s error in %.2fs: %s", model, time.monotonic() - t0, err)
                 raise err
             attempt += 1
             continue
@@ -238,7 +238,6 @@ class CloudflareAI:
         headers = self._headers()
         attempt = 0
         last: Exception | None = None
-        t0 = time.monotonic()
         while True:
             try:
                 resp = self._session().post(url, headers=headers, data=data,
@@ -246,7 +245,6 @@ class CloudflareAI:
             except Exception as exc:  # noqa: BLE001
                 last = exc
                 if attempt >= self.max_retries:
-                    logger.warning("cloudflare: %s multipart network error after %.2fs: %s", model, time.monotonic() - t0, exc)
                     raise CloudflareAIError(f"network error calling {model}: {exc}", status=0, retryable=True) from exc
                 attempt += 1
                 continue
@@ -256,30 +254,25 @@ class CloudflareAI:
                 except Exception:  # noqa: BLE001
                     return resp.content
                 if body.get("success", True) and not body.get("errors"):
-                    logger.info("cloudflare: %s multipart ok in %.2fs", model, time.monotonic() - t0)
                     return body.get("result", body)
                 message, retryable = _parse_error(resp)
                 err = CloudflareAIError(message, status=resp.status_code, retryable=retryable)
                 if not retryable or attempt >= self.max_retries:
-                    logger.warning("cloudflare: %s multipart error in %.2fs: %s", model, time.monotonic() - t0, err)
                     raise err
                 attempt += 1
                 continue
             if resp.status_code in {429}:
                 err = CloudflareAIError(_parse_error(resp)[0], status=429, retryable=False)
-                logger.warning("cloudflare: %s multipart 429 in %.2fs", model, time.monotonic() - t0)
                 raise err
             message, retryable = _parse_error(resp)
             err = CloudflareAIError(message, status=resp.status_code, retryable=retryable)
             if not retryable or attempt >= self.max_retries:
-                logger.warning("cloudflare: %s multipart error in %.2fs: %s", model, time.monotonic() - t0, err)
                 raise err
             attempt += 1
             continue
 
     def describe(self, image_rgb: np.ndarray, point_x: float, point_y: float) -> str:
         """Ask the vision LLM what object the tap selects; empty string if unknown."""
-        t0 = time.monotonic()
         img = np.asarray(image_rgb, dtype=np.uint8)
         h, w = img.shape[:2]
         x = int(np.clip(round(point_x), 0, w - 1))
@@ -298,13 +291,10 @@ class CloudflareAI:
             resp = result.get("response", "")
         else:
             resp = ""
-        label = _clean_label(str(resp))
-        logger.info("cloudflare: vision describe done in %.2fs label=%r", time.monotonic() - t0, label)
-        return label
+        return _clean_label(str(resp))
 
     def detect_object(self, image_rgb: np.ndarray, point_x: float, point_y: float):
         """Return (box, label, score) for the detected object containing the tap."""
-        t0 = time.monotonic()
         if not self.detection_model:
             return None
         img = np.asarray(image_rgb, dtype=np.uint8)
@@ -347,60 +337,76 @@ class CloudflareAI:
                     _clean_label(str(label)),
                     score,
                 )
-        logger.info("cloudflare: DETR detect_object done in %.2fs best=%s", time.monotonic() - t0, best)
         return best
 
     def recolor_klein(self, image_rgb: np.ndarray, mask: np.ndarray, prompt: str,
                       size: int = 1024, seed: int | None = None) -> np.ndarray:
-        """FLUX.2 [klein] 4B guided edit: send image+mask+prompt, return RGB."""
-        t0 = time.monotonic()
+        """Call Cloudflare FLUX.2 Klein with the documented reference-image fields.
+
+        Workers AI Klein supports up to four reference images named
+        ``input_image_0`` .. ``input_image_3``. It does NOT expose a native
+        inpainting mask, so the SAM 2 mask is sent only as a second *reference
+        image* and is enforced authoritatively during final local compositing.
+        Each reference image must be smaller than 512x512.
+        """
         if not self.klein_model:
             raise CloudflareAIError(
                 "CLOUDFLARE_KLEIN_MODEL is not configured; cannot run FLUX.2 [klein]. "
-                "Set CLOUDFLARE_RECOLOR_MODEL=inpaint to use inpaint instead.",
+                "Set CLOUDFLARE_RECOLOR_MODEL=inpaint to use the separate inpaint endpoint.",
                 status=500, retryable=False)
+        if Image is None:
+            raise CloudflareAIError("Pillow is required for FLUX reference images", status=500, retryable=False)
+
         img = np.asarray(image_rgb, dtype=np.uint8)
-        m = mask if mask is not None else np.zeros(img.shape[:2], bool)
-        m = m.astype(bool)
-        box_w, box_h = ops_bbox_size(m)
-        cw, ch = _fit_klein_input_size(box_w, box_h, size)
-        payload_size = max(cw, ch)
-        img_bytes, (rw, rh) = _resize_with_ratio(img, payload_size)
-        # Scale mask to the payload size as a PNG.
+        if img.ndim != 3 or img.shape[2] != 3 or img.size == 0:
+            raise ValueError("image_rgb must be a non-empty HxWx3 RGB array")
+        h, w = img.shape[:2]
+        m = np.asarray(mask, dtype=bool) if mask is not None else np.zeros((h, w), dtype=bool)
+        if m.shape != (h, w):
+            raise ValueError(f"mask shape {m.shape} does not match image shape {(h, w)}")
+        if not m.any():
+            raise CloudflareAIError("SAM 2 returned an empty mask; FLUX call cancelled", status=422, retryable=False)
+
+        # All input references must be strictly less than 512px on either side.
+        # Use 480px so rounding to the 32px model grid can never exceed the cap.
+        input_cap = min(480, max(64, int(size)))
+        img_bytes, (in_w, in_h) = _resize_with_ratio(img, input_cap)
         if cv2 is not None:
-            mask_resized = cv2.resize(m.astype(np.uint8), (rw, rh), interpolation=cv2.INTER_NEAREST)
+            mask_resized = cv2.resize(m.astype(np.uint8), (in_w, in_h), interpolation=cv2.INTER_NEAREST)
         else:
-            mask_resized = np.asarray(Image.fromarray((m * 255).astype(np.uint8)).resize((rw, rh), Image.NEAREST))
+            mask_resized = np.asarray(
+                Image.fromarray((m.astype(np.uint8) * 255), mode="L").resize((in_w, in_h), Image.Resampling.NEAREST),
+                dtype=np.uint8,
+            )
         mask_bytes = _mask_to_png_bytes(mask_resized)
-        # FLUX.2 [klein] via Workers AI rejects a JSON body: its schema at the
-        # top level requires `multipart`. Send image+mask as file uploads and the
-        # scalar knobs as form fields (checked live: JSON "image" byte arrays
-        # return 400 "required properties at '/' are 'multipart'").
+
+        # Output size is independent of the reference-image limit. Preserve
+        # photo aspect ratio but cap the longest generated side to configuration.
+        output_cap = min(1536, max(512, int(size)))
+        out_w, out_h = _fit_klein_input_size(w, h, output_cap)
         fields = {
             "prompt": prompt,
-            "width": str(rw),
-            "height": str(rh),
+            "width": str(out_w),
+            "height": str(out_h),
             "seed": str(seed or 0),
             "guidance": str(self.klein_guidance),
         }
         files = {
-            "input_image_0": (
-                "input_image_0.png",
-                img_bytes,
-                "image/png",
-            ),
+            "input_image_0": ("input_image_0.png", img_bytes, "image/png"),
+            "input_image_1": ("input_image_1_mask.png", mask_bytes, "image/png"),
         }
+        logger.info(
+            "cloudflare: Klein request source=%dx%d mask=%dpx input_ref=%dx%d mask_ref=%dx%d output=%dx%d",
+            w, h, int(m.sum()), in_w, in_h, in_w, in_h, out_w, out_h,
+        )
         result = self._run_multipart(self.klein_model, fields, files)
-        out = _decode_image_result(result, img.shape)
-        logger.info("cloudflare: klein recolor done in %.2fs (model=%s)", time.monotonic() - t0, self.klein_model)
-        return out
+        return _decode_image_result(result, img.shape)
 
     def inpaint(self, image_rgb: np.ndarray, mask: np.ndarray, prompt: str,
                 negative_prompt: str = "", strength: float = 0.82,
                 num_steps: int = 20, guidance: float = 7.5,
                 size: int = 1024, seed: int | None = None) -> np.ndarray:
         """SD-1.5 inpainting: image+mask as byte arrays per the live API contract."""
-        t0 = time.monotonic()
         if not self.inpaint_model:
             raise CloudflareAIError(
                 "CLOUDFLARE_INPAINT_MODEL is not configured; cannot run inpaint.",
@@ -428,13 +434,10 @@ class CloudflareAI:
             "seed": seed or 0,
         }
         result = self._run(self.inpaint_model, payload)
-        out = _decode_image_result(result, img.shape)
-        logger.info("cloudflare: inpaint done in %.2fs (model=%s)", time.monotonic() - t0, self.inpaint_model)
-        return out
+        return _decode_image_result(result, img.shape)
 
     def _raw_post(self, model: str, blob: bytes) -> Any:
         """Post raw binary (image) to a model endpoint, e.g. DETR detection."""
-        t0 = time.monotonic()
         url = f"{self.base_url}/run/{model}"
         headers = self._headers()
         headers["Content-Type"] = "image/png"
@@ -444,7 +447,6 @@ class CloudflareAI:
                 resp = self._session().post(url, headers=headers, data=blob, timeout=self.timeout)
             except Exception as exc:  # noqa: BLE001
                 if attempt >= self.max_retries:
-                    logger.warning("cloudflare: %s raw network error after %.2fs: %s", model, time.monotonic() - t0, exc)
                     raise CloudflareAIError(f"network error calling {model}: {exc}", status=0, retryable=True) from exc
                 attempt += 1
                 continue
@@ -452,22 +454,18 @@ class CloudflareAI:
                 try:
                     body = resp.json()
                 except Exception:  # noqa: BLE001
-                    logger.info("cloudflare: %s raw ok in %.2fs (binary)", model, time.monotonic() - t0)
                     return resp.content
                 if body.get("success", True) and not body.get("errors"):
-                    logger.info("cloudflare: %s raw ok in %.2fs", model, time.monotonic() - t0)
                     return body.get("result", body)
                 message, retryable = _parse_error(resp)
                 err = CloudflareAIError(message, status=resp.status_code, retryable=retryable)
                 if not retryable or attempt >= self.max_retries:
-                    logger.warning("cloudflare: %s raw error in %.2fs: %s", model, time.monotonic() - t0, err)
                     raise err
                 attempt += 1
                 continue
             message, retryable = _parse_error(resp)
             err = CloudflareAIError(message, status=resp.status_code, retryable=retryable)
             if not retryable or attempt >= self.max_retries:
-                logger.warning("cloudflare: %s raw error in %.2fs: %s", model, time.monotonic() - t0, err)
                 raise err
             attempt += 1
             continue

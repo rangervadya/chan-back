@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 from typing import Any
 
 import numpy as np
@@ -336,7 +335,6 @@ def _get_predictor(model_name: str | None = None) -> Any:
 
         _logger.info("_get_predictor: loading model=%s device=%s threads=%d", requested, device, threads)
 
-        t_load = time.monotonic()
         try:
             if os.path.isdir(requested):
                 predictor = _load_local_predictor(requested, device)
@@ -362,9 +360,6 @@ def _get_predictor(model_name: str | None = None) -> Any:
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 
-        load_time = time.monotonic() - t_load
-        _logger.info("_get_predictor: model loaded in %.3fs", load_time)
-
         _PREDICTOR = predictor
         _PREDICTOR_MODEL_ID = requested
         _PREDICTOR_DEVICE = device
@@ -380,121 +375,74 @@ def _get_predictor(model_name: str | None = None) -> Any:
 
 def _prediction_candidates(
     predictor: Any,
-    x: int,
-    y: int,
+    positive_points: list[tuple[int, int]],
+    negative_points: list[tuple[int, int]] | None = None,
 ) -> list[tuple[np.ndarray, float]]:
+    """Ask SAM 2 for candidates constrained by positive and negative clicks."""
+    negative_points = negative_points or []
+    points = positive_points + negative_points
+    labels = ([1] * len(positive_points)) + ([0] * len(negative_points))
     masks, scores, _ = predictor.predict(
-        point_coords=np.asarray([[x, y]], dtype=np.float32),
-        point_labels=np.asarray([1], dtype=np.int32),
+        point_coords=np.asarray(points, dtype=np.float32),
+        point_labels=np.asarray(labels, dtype=np.int32),
         multimask_output=True,
     )
 
     mask_array = _as_numpy(masks)
     score_array = _as_numpy(scores).astype(np.float32).reshape(-1)
-
     if mask_array.ndim == 2:
         mask_array = mask_array[None, ...]
-
     if mask_array.ndim != 3:
         raise Sam2UnavailableError(
             f"Unexpected SAM 2 mask dimensions: {mask_array.shape}"
         )
 
     candidates: list[tuple[np.ndarray, float]] = []
-
     for index, raw_mask in enumerate(mask_array):
         mask = np.asarray(raw_mask > 0, dtype=bool)
-
         if not mask.any():
             continue
-
-        score = (
-            float(score_array[index])
-            if index < len(score_array)
-            else 0.0
-        )
-
+        score = float(score_array[index]) if index < len(score_array) else 0.0
         candidates.append((mask, score))
-
     return candidates
 
 
 def _select_candidate(
     candidates: list[tuple[np.ndarray, float]],
-    x: int,
-    y: int,
+    positive_points: list[tuple[int, int]],
+    negative_points: list[tuple[int, int]] | None = None,
     reference: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float] | None:
-    """
-    Select a mask containing the prompt.
-
-    For jitter points, prefer a mask representing the same object instance
-    as the primary mask.
-    """
-    eligible = [
-        (mask, score)
-        for mask, score in candidates
-        if mask[y, x]
-    ]
-
-    if not eligible:
-        eligible = candidates
+    """Select a candidate containing every positive point and no protected point."""
+    negative_points = negative_points or []
+    eligible = []
+    for mask, score in candidates:
+        if not all(mask[y, x] for x, y in positive_points):
+            continue
+        if any(mask[y, x] for x, y in negative_points):
+            continue
+        eligible.append((mask, score))
 
     if not eligible:
         return None
-
     if reference is None:
-        return max(
-            eligible,
-            key=lambda item: (
-                item[1],
-                int(item[0].sum()),
-            ),
-        )
+        return max(eligible, key=lambda item: (item[1], int(item[0].sum())))
 
     ref_area = max(int(reference.sum()), 1)
-
     scored: list[tuple[float, np.ndarray, float]] = []
-
     for mask, score in eligible:
-        intersection = int(
-            np.logical_and(mask, reference).sum()
-        )
-        union = int(
-            np.logical_or(mask, reference).sum()
-        )
-
+        intersection = int(np.logical_and(mask, reference).sum())
+        union = int(np.logical_or(mask, reference).sum())
         iou = intersection / max(union, 1)
-
-        # Reject masks that likely jumped to a different instance.
         if iou < 0.45:
             continue
-
         mask_area = int(mask.sum())
-
-        area_ratio = (
-            min(mask_area, ref_area)
-            / max(mask_area, ref_area, 1)
-        )
-
-        combined_score = (
-            0.70 * iou
-            + 0.25 * score
-            + 0.05 * area_ratio
-        )
-
-        scored.append(
-            (combined_score, mask, score)
-        )
-
+        area_ratio = min(mask_area, ref_area) / max(mask_area, ref_area, 1)
+        combined_score = 0.70 * iou + 0.25 * score + 0.05 * area_ratio
+        scored.append((combined_score, mask, score))
     if not scored:
         return None
-
-    _, chosen, chosen_score = max(
-        scored,
-        key=lambda item: item[0],
-    )
-
+    _, chosen, chosen_score = max(scored, key=lambda item: item[0])
     return chosen, chosen_score
 
 
@@ -504,6 +452,7 @@ def segment_with_sam2(
     point_y: float,
     *,
     model_name: str | None = None,
+    negative_points: list[tuple[float, float]] | None = None,
 ) -> SegmentationResult:
     """
     Return a point-selected object mask from SAM 2.
@@ -527,44 +476,54 @@ def segment_with_sam2(
 
     x = int(np.clip(round(point_x), 0, w - 1))
     y = int(np.clip(round(point_y), 0, h - 1))
+    neg_points: list[tuple[int, int]] = []
+    for point in (negative_points or [])[:32]:
+        try:
+            nx = int(np.clip(round(float(point[0])), 0, w - 1))
+            ny = int(np.clip(round(float(point[1])), 0, h - 1))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if (nx, ny) != (x, y) and (nx, ny) not in neg_points:
+            neg_points.append((nx, ny))
+    if any(abs(nx - x) <= 2 and abs(ny - y) <= 2 for nx, ny in neg_points):
+        raise Sam2UnavailableError(
+            "A protected point overlaps the recolor point; remove that protection point and retry"
+        )
 
-    t_start = time.monotonic()
     _logger.info(
-        "segment_with_sam2: image=%dx%d point=(%d,%d) model_name=%s",
-        w, h, x, y, model_name,
+        "segment_with_sam2: image=%dx%d point=(%d,%d) negative_points=%d model_name=%s",
+        w, h, x, y, len(neg_points), model_name,
     )
 
-    t_load = time.monotonic()
     predictor = _get_predictor(model_name)
-    load_time = time.monotonic() - t_load
-    _logger.info("segment_with_sam2: predictor ready in %.3fs (cached=%s)", load_time, _PREDICTOR is not None)
 
     try:
         import torch
 
-        t_embed = time.monotonic()
         with torch.inference_mode():
             predictor.set_image(image)
-            embed_time = time.monotonic() - t_embed
-            _logger.info("segment_with_sam2: image embedding set in %.3fs", embed_time)
+            _logger.info("segment_with_sam2: image embedding set")
 
-            t_prim = time.monotonic()
             initial = _select_candidate(
-                _prediction_candidates(predictor, x, y),
-                x,
-                y,
+                _prediction_candidates(predictor, [(x, y)], neg_points),
+                [(x, y)],
+                neg_points,
             )
 
             if initial is None:
+                if neg_points:
+                    raise Sam2UnavailableError(
+                        "SAM 2 could not honour the protected points. Add another protection point "
+                        "inside the screen/camera/logo or remove a conflicting point."
+                    )
                 raise Sam2UnavailableError(
                     "SAM 2 did not return a mask for the tapped point"
                 )
 
             primary, primary_score = initial
-            prim_time = time.monotonic() - t_prim
             _logger.info(
-                "segment_with_sam2: primary mask score=%.3f area=%dpx in %.3fs",
-                float(primary_score), int(primary.sum()), prim_time,
+                "segment_with_sam2: primary mask score=%.3f area=%dpx",
+                float(primary_score), int(primary.sum()),
             )
 
             # Jitter points by a few source pixels to stabilize uncertain
@@ -584,18 +543,18 @@ def segment_with_sam2(
             selected = [primary]
             selected_scores = [primary_score]
 
-            t_jitter = time.monotonic()
             for jx, jy in point_specs:
+                positive_specs = [(x, y), (jx, jy)]
                 candidates = _prediction_candidates(
                     predictor,
-                    jx,
-                    jy,
+                    positive_specs,
+                    neg_points,
                 )
 
                 chosen = _select_candidate(
                     candidates,
-                    jx,
-                    jy,
+                    positive_specs,
+                    neg_points,
                     reference=primary,
                 )
 
@@ -612,8 +571,6 @@ def segment_with_sam2(
                         "segment_with_sam2: jitter point (%d,%d) rejected (no match)",
                         jx, jy,
                     )
-            jitter_time = time.monotonic() - t_jitter
-            _logger.info("segment_with_sam2: jitter predictions done in %.3fs (%d points)", jitter_time, len(point_specs))
 
     except Sam2UnavailableError:
         raise
@@ -705,11 +662,18 @@ def segment_with_sam2(
             exc,
         )
 
-    total_time = time.monotonic() - t_start
-    _logger.info(
-        "segment_with_sam2: done in %.3fs total (load=%.3fs embed=%.3fs primary=%.3fs jitter=%.3fs)",
-        total_time, load_time, embed_time, prim_time, jitter_time,
-    )
+    # Morphological cleanup can close a tiny pinhole over a protected click.
+    # Never accept a mask that includes one of the explicit exclusion points.
+    included_protected = [(nx, ny) for nx, ny in neg_points if mask[ny, nx]]
+    if included_protected:
+        _logger.warning(
+            "segment_with_sam2: SAM 2 mask includes protected points: %s",
+            included_protected,
+        )
+        raise Sam2UnavailableError(
+            "SAM 2 could not exclude one or more protected details. "
+            "Add another protection point inside that detail and retry."
+        )
 
     return SegmentationResult(
         mask=mask.astype(bool),
@@ -728,11 +692,10 @@ def segment_with_sam2(
         notes=[
             (
                 f"SAM 2 model={_PREDICTOR_MODEL_ID}; "
-                f"device={_PREDICTOR_DEVICE}; "
-                f"total_time={total_time:.3f}s"
+                f"device={_PREDICTOR_DEVICE}"
             ),
             (
-                f"point ({x},{y}); "
+                f"point ({x},{y}); negative points={len(neg_points)}; "
                 f"mask area={float(mask.mean()) * 100:.2f}%"
             ),
             (
