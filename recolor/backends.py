@@ -32,6 +32,91 @@ class BackendConfigurationError(RuntimeError):
 _METALLIC_VARIANTS = set(METALLIC_VARIANTS)
 
 
+def _normalize_material(value) -> str:
+    """Normalize UI/API material labels to the canonical backend vocabulary.
+
+    Clients may send Russian labels, English synonyms, adjectives, or keys with
+    underscores/hyphens. Canonical names keep the prompt rules and final color
+    composition in agreement; unknown values safely use the generic object rule.
+    """
+    raw = str(value or "object").strip().casefold().replace("ё", "е")
+    key = " ".join(raw.replace("_", " ").replace("-", " ").split())
+    aliases = {
+        # wood
+        "wood": "wood", "wooden": "wood", "timber": "wood",
+        "дерево": "wood", "древесина": "wood", "деревянный": "wood",
+        "деревянная": "wood", "деревянное": "wood", "древесный": "wood",
+        # fabric / textile
+        "fabric": "fabric", "cloth": "fabric", "textile": "fabric",
+        "ткань": "fabric", "тканевый": "fabric", "тканевая": "fabric",
+        "тканевое": "fabric", "текстиль": "fabric", "текстильный": "fabric",
+        # leather
+        "leather": "leather", "leatherette": "leather", "faux leather": "leather",
+        "экокожа": "leather", "кожа": "leather", "кожаный": "leather",
+        "кожаная": "leather", "кожаное": "leather", "натуральная кожа": "leather",
+        "искусственная кожа": "leather",
+        # glass
+        "glass": "glass", "стекло": "glass", "стеклянный": "glass",
+        "стеклянная": "glass", "стеклянное": "glass",
+        # metal variants
+        "metal": "metal", "metallic": "metal", "steel": "metal",
+        "stainless steel": "metal", "brushed metal": "metal", "iron": "metal",
+        "aluminum": "metal", "aluminium": "metal", "chrome": "metal",
+        "chromium": "metal", "titanium": "metal", "copper": "metal",
+        "silver": "metal", "gold": "metal", "металл": "metal",
+        "металлический": "metal", "металлическая": "metal", "металлическое": "metal",
+        "бронза": "bronze", "бронзовый": "bronze", "бронзовая": "bronze",
+        "bronze": "bronze",
+        # plastic
+        "plastic": "plastic", "polymer": "plastic", "пластик": "plastic",
+        "пластмасса": "plastic", "пластиковый": "plastic", "пластиковая": "plastic",
+        "пластиковое": "plastic", "пластмассовый": "plastic",
+        # ceramic
+        "ceramic": "ceramic", "porcelain": "ceramic", "керамика": "ceramic",
+        "керамический": "ceramic", "керамическая": "ceramic", "фарфор": "ceramic",
+        # concrete
+        "concrete": "concrete", "cement": "concrete", "бетон": "concrete",
+        "бетонный": "concrete", "бетонная": "concrete", "цемент": "concrete",
+        # deliberately texture-free material
+        "no texture": "no_texture", "notexture": "no_texture", "без текстуры": "no_texture",
+        "однотонный": "no_texture", "однотонная": "no_texture",
+        # generic labels
+        "object": "object", "selected object": "object", "unknown object": "object",
+        "объект": "object", "другое": "object", "другой материал": "object", "other": "object",
+    }
+    if key in aliases:
+        return aliases[key]
+
+    # Accept labels such as "natural wood", "metal surface" or localized UI
+    # labels that contain the canonical material as part of a longer phrase.
+    phrase_aliases = (
+        ("без текстуры", "no_texture"), ("no texture", "no_texture"),
+        ("искусственная кожа", "leather"), ("натуральная кожа", "leather"),
+        ("leather", "leather"), ("кож", "leather"),
+        ("wood", "wood"), ("дерев", "wood"), ("древес", "wood"),
+        ("fabric", "fabric"), ("textile", "fabric"), ("cloth", "fabric"),
+        ("ткан", "fabric"), ("текстил", "fabric"),
+        ("glass", "glass"), ("стекл", "glass"),
+        ("bronze", "bronze"), ("бронз", "bronze"),
+        ("metal", "metal"), ("steel", "metal"), ("металл", "metal"),
+        ("plastic", "plastic"), ("пласт", "plastic"),
+        ("ceramic", "ceramic"), ("porcelain", "ceramic"), ("керамик", "ceramic"),
+        ("concrete", "concrete"), ("cement", "concrete"), ("бетон", "concrete"),
+    )
+    for phrase, canonical in phrase_aliases:
+        if key == phrase or phrase in key:
+            return canonical
+
+    configured_variants = {
+        " ".join(str(item).casefold().replace("_", " ").replace("-", " ").split())
+        for item in _METALLIC_VARIANTS
+    }
+    if key in configured_variants:
+        return "bronze" if "bronze" in key else "metal"
+
+    return "object"
+
+
 class BaseBackend:
     name = "base"
 
@@ -391,7 +476,9 @@ class CloudflareBackend(_AnalyzingMixin):
         diag.metric("crop_size", list(_crop_for_diag(image, mask).shape[:2]))
         diag.capture("04_model_output", painted, note="ответ генеративной модели до композиции")
         diag.metric("model_output_shape", list(painted.shape[:2]))
-        coverage_issue = _validate_pixel_coverage(painted, image, mask, request.target_rgb, request.material)
+        coverage_issue = _validate_pixel_coverage(
+            painted, image, mask, request.target_rgb, _normalize_material(request.material)
+        )
         diag.metric("coverage_issue_before_composite", coverage_issue or "none")
         if coverage_issue:
             notes.append(f"диагностика покрытия: {coverage_issue}")
@@ -751,7 +838,7 @@ def build_recolor_prompt(request: RecolorRequest, object_label: str, color_name:
     selected surface into a uniform color. Geometry and unselected areas remain
     protected by the downstream mask-based composition.
     """
-    material = (str(getattr(request, "material", "object") or "object")).strip().lower()
+    material = _normalize_material(getattr(request, "material", "object"))
     color = str(
         color_name
         or getattr(request, "hex_color", "")
@@ -985,7 +1072,7 @@ def _hybrid_finish(
             return recolor(src, m, request, feather_px=feather_px)
         return src.copy()
 
-    material_key = (material or "object").strip().lower()
+    material_key = _normalize_material(material)
     target = np.uint8([[list(tuple(int(np.clip(c, 0, 255)) for c in target_rgb))]])
     target_lab = cv2.cvtColor(target, cv2.COLOR_RGB2LAB).astype(np.float32)[0, 0]
     source_lab = cv2.cvtColor(src, cv2.COLOR_RGB2LAB).astype(np.float32)
@@ -1137,7 +1224,7 @@ def _enforce_coverage(image: np.ndarray, mask: np.ndarray,
     out_rgb = np.clip(image, 0, 255).astype(np.uint8).copy()
     lab = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
     target_lab = cv2.cvtColor(np.uint8([[list(target_rgb)]]), cv2.COLOR_RGB2LAB).astype(np.float32)[0, 0]
-    material = (material or "object").lower()
+    material = _normalize_material(material)
     # Preserve more generated chroma structure on metal; less on glass/plastic.
     detail_scale = {"metal": 0.38, "bronze": 0.38, "wood": 0.24, "leather": 0.22,
                     "fabric": 0.24, "plastic": 0.12, "glass": 0.12,
