@@ -698,17 +698,49 @@ def _cfg(name: str, default):
 
 
 def _color_name(request: RecolorRequest) -> str:
-    if getattr(request, "color_name", ""):
-        logger.info("_color_name: using provided color_name=%s", request.color_name)
-        return request.color_name
+    """Return a readable color name, or the valid HEX itself as a fallback.
+
+    Color-name tables usually contain only a limited palette. A valid HEX that
+    is absent from the table must still be usable by the prompt builder.
+    """
+    provided = str(getattr(request, "color_name", "") or "").strip()
+    if provided:
+        logger.info("_color_name: using provided color_name=%s", provided)
+        return provided
+
+    raw_hex = getattr(request, "color_hex", None)
+    try:
+        if isinstance(raw_hex, str):
+            value_str = raw_hex.strip()
+            if value_str.startswith("#"):
+                value_str = value_str[1:]
+            if value_str.lower().startswith("0x"):
+                value_str = value_str[2:]
+            value = int(value_str, 16)
+        else:
+            value = int(raw_hex)
+        if not 0 <= value <= 0xFFFFFF:
+            raise ValueError("HEX color must be between 0x000000 and 0xFFFFFF")
+        hex_code = f"#{value:06X}"
+    except (TypeError, ValueError):
+        logger.warning("_color_name: invalid color_hex=%r", raw_hex)
+        return ""
+
     try:
         from config import get_color_hex_name
-        name = get_color_hex_name(request.color_hex)
-        logger.info("_color_name: resolved from hex %s -> %s", hex(request.color_hex), name)
-        return name
-    except Exception:
-        logger.warning("_color_name: failed to resolve name for hex=%s", hex(request.color_hex))
-        return ""
+        name = get_color_hex_name(value)
+        if name and str(name).strip():
+            name = str(name).strip()
+            logger.info("_color_name: resolved %s -> %s", hex_code, name)
+            return name
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "_color_name: lookup failed for %s (%s); using HEX fallback",
+            hex_code, exc,
+        )
+
+    logger.info("_color_name: using HEX fallback %s", hex_code)
+    return hex_code
 
 
 def build_recolor_prompt(request: RecolorRequest, object_label: str, color_name: str) -> str:
@@ -720,7 +752,7 @@ def build_recolor_prompt(request: RecolorRequest, object_label: str, color_name:
     imply that Klein supports a native inpainting-mask parameter.
     """
     material = (str(getattr(request, "material", "object") or "object")).strip().lower()
-    color = str(color_name or getattr(request, "hex_color", f"#{request.color_hex:06X}"))
+    color = str(color_name or getattr(request, "hex_color", "") or f"#{int(request.color_hex):06X}")
     hex_color = f"#{int(request.color_hex):06X}"
     try:
         rgb = tuple(int(v) for v in (request.color_r, request.color_g, request.color_b))
@@ -1182,3 +1214,4 @@ def _append_diag_note(notes: list[str], summary: dict) -> None:
             f"остаточные отличия от оригинала {metrics.get('residual_original_fraction', 0) * 100:.1f}%; "
             f"изменения вне маски {metrics.get('changed_outside_mask', 0) * 100:.2f}%"
         )
+
