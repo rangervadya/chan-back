@@ -1,79 +1,83 @@
-# --- Python ---
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# Environment
+.env
+.env.*
+# .env-i is the original env template file (kept locally for reference, not committed)
+client/.env-i
+!.env.example
+# Клиентский .env содержит только значения по умолчанию (без секретов) и
+# обязателен как Flutter asset — коммитим, чтобы сборка не падала на CI.
+# Реальные секреты передаются через --dart-define.
+!client/.env
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Python virtual environment
+.venv/
 __pycache__/
 *.py[cod]
 *$py.class
+server/.venv/
+server/Lib/
+server/Scripts/
+server/share/
+server/pyvenv.cfg
+MobileSAM/.venv/
+MobileSAM/Lib/
+MobileSAM/Scripts/
+MobileSAM/share/
+MobileSAM/pyvenv.cfg
+
+# Python cache
 *.pyc
 *.pyo
-.Python
-.venv/
-venv/
-env/
-.server/
 
-# --- Dependencies (если используются в IDE) ---
-.eggs/
-.eggs/
-develop-eggs/
-dist/
-build/
-downloads/
-eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# --- Pytest ---
-.pytest_cache/
-.coverage
-htmlcov/
-
-# --- Environment files (НИКОГДА не коммитить секреты!) ---
-.env
-.env.*
-!.env.example
-.env.bak
-
-# --- HuggingFace cache / модели ---
-hf_cache/
-model_cache/
-.server_models/
-models/
-.huggingface/
-~/.cache/huggingface/
-
-# --- Debug output ---
+docs/
+hf_cache
+server/debug_output/
 debug_output/
-logs/
-*.log
-
-# --- IDE ---
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.project
-.pydevproject
-lsp/.vs-code/
-
-# --- OS ---
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# --- Docker ---
-.docker/
-
-# --- Git ---
-.git
+server/vendor/
+.kilo

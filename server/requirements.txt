@@ -1,0 +1,18 @@
+# === Базовые зависимости HTTP API и обработки изображений ===
+# Рекомендованный backend sam2-local устанавливает CPU PyTorch и SAM 2
+# отдельно из requirements.sam2.txt. Для старого GPU Flux см. requirements.ai.txt.
+
+# Веб-сервер
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+python-dotenv>=1.0.0
+
+# Обработка изображений
+numpy>=1.24.0
+Pillow>=10.0.0
+opencv-python-headless>=4.9.0
+scipy>=1.10.0
+
+# HTTP-клиенты к бесплатным API (Cloudflare Workers AI / Google Gemini)
+requests>=2.31.0

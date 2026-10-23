@@ -1,0 +1,858 @@
+import os
+import time
+import traceback
+import gc
+import math
+import re
+import json
+import secrets
+import threading
+from collections import defaultdict, deque
+import numpy as np
+try:  # Optional: required only for explicitly selected AI_BACKEND=legacy.
+    import torch
+except ImportError:  # CPU/API mode does not depend on PyTorch.
+    torch = None
+from io import BytesIO
+from contextlib import asynccontextmanager
+try:  # Optional: imported only if the legacy local FLUX backend is requested.
+    from diffusers import Flux2KleinInpaintPipeline
+except ImportError:
+    Flux2KleinInpaintPipeline = None
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import Response
+from PIL import Image, ImageOps
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+from logger import get_logger
+from config import (
+    SAM2_MODEL_NAME, SAM2_LOCAL_MODEL_PATH, SAM2_LOCAL_FILES_ONLY, SAM2_JITTER_OFFSETS, SAM2_MIN_CONSISTENCY_IOU, SAM2_MIN_MASK_AREA,
+    SAM2_MASK_CONSENSUS, SAM2_MASK_CONSENSUS_MIN_RATIO,
+    FLUX_MODEL_NAME, FLUX_TORCH_DTYPE_NAME,
+    FLUX_MAX_STEPS, FLUX_DEFAULT_GUIDANCE_SCALE, FLUX_DEFAULT_NUM_INFERENCE_STEPS,
+    FLUX_DEFAULT_STRENGTH, FLUX_MIN_GUIDANCE_SCALE, FLUX_FALLBACK_GUIDANCE_SCALE,
+    MAX_IMAGE_SIZE_BYTES, MAX_IMAGE_DIMENSION, MAX_INFERENCE_SIZE,
+    ALLOWED_MATERIALS, MATERIAL_PROMPTS, DEFAULT_PROMPT, BRIGHT_COLORS, EXACT_METAL_NAMES,
+    _CSS_NAMED_COLORS, _GRAY_COLORS, _EXACT_METAL_GRAYS, _EXACT_GRAYS, _EXACT_COLOR_NAMES,
+)
+
+logger = get_logger(__name__)
+
+
+# ---------- Ограничения безопасности (ключи доступа) ----------
+_api_keys_env = os.getenv("API_KEYS", "").strip()
+VALID_API_KEYS = {k.strip() for k in _api_keys_env.split(",") if k.strip()}
+
+class SlidingWindowRateLimiter:
+    """Thread-safe in-process rate limiter; mirrors the former 10/minute limit."""
+
+    def __init__(self) -> None:
+        self._events: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+        self._last_cleanup = 0.0
+
+    def consume(self, key: str, limit: int = 10, window_seconds: float = 60.0) -> tuple[bool, int]:
+        now = time.monotonic()
+        cutoff = now - window_seconds
+        with self._lock:
+            events = self._events[key]
+            while events and events[0] <= cutoff:
+                events.popleft()
+            if len(events) >= limit:
+                return False, max(1, int(window_seconds - (now - events[0])))
+            events.append(now)
+            # Periodically remove inactive IP keys so the table cannot grow forever.
+            if now - self._last_cleanup >= window_seconds:
+                for ip, queue in list(self._events.items()):
+                    while queue and queue[0] <= cutoff:
+                        queue.popleft()
+                    if not queue:
+                        self._events.pop(ip, None)
+                self._last_cleanup = now
+            return True, 0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._events.clear()
+            self._last_cleanup = 0.0
+
+
+limiter = SlidingWindowRateLimiter()
+
+
+def rate_limit_recolor(request: Request) -> None:
+    client_host = request.client.host if request.client else "unknown"
+    allowed, retry_after = limiter.consume(client_host, limit=10, window_seconds=60)
+    if not allowed:
+        logger.warning("Rate limit exceeded for %s", client_host)
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded: maximum 10 recolor requests per minute.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def sanitize_prompt_text(text: str, max_length: int = 50) -> str:
+    if not text:
+        return "object"
+    cleaned = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE).strip()
+    cleaned = cleaned[:max_length]
+    return cleaned or "object"
+
+
+def parse_rgb_color(value: str | int) -> int:
+    """Parse a 24-bit RGB value without confusing Flutter ARGB with RGB."""
+    raw = str(value).strip()
+    try:
+        if raw.startswith("#"):
+            parsed = int(raw[1:], 16)
+        elif raw.lower().startswith("0x"):
+            parsed = int(raw[2:], 16)
+        elif len(raw) == 6 and all(ch in "0123456789abcdefABCDEF" for ch in raw):
+            parsed = int(raw, 16)
+        else:
+            parsed = int(raw, 10)
+    except ValueError as exc:
+        raise HTTPException(400, "color_hex must be #RRGGBB, 0xRRGGBB, six-digit hex, or a decimal RGB integer") from exc
+    if not 0 <= parsed <= 0xFFFFFF:
+        raise HTTPException(400, "color_hex must describe a 24-bit RGB colour (without an alpha byte)")
+    return parsed
+
+
+def mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    intersection = np.logical_and(mask_a, mask_b).sum()
+    union = np.logical_or(mask_a, mask_b).sum()
+    if union == 0:
+        return 0.0
+    return float(intersection / union)
+
+
+def _morph_erode(mask_bool: np.ndarray, iterations: int = 1) -> np.ndarray:
+    """Лёгкая эрозия (сжатие) 4-связным ядром.
+
+    Срезает 1px неуверенного «гало» на границе маски, уменьшая захват лишней
+    площади вокруг тонких объектов (провода). Не удаляет тело объекта целиком
+    (в отличие от полного opening, который стирает тонкие линии).
+    Без внешних зависимостей (numpy sliding_window_view).
+    """
+    if iterations <= 0 or mask_bool.shape[0] < 3 or mask_bool.shape[1] < 3:
+        return mask_bool
+    from numpy.lib.stride_tricks import sliding_window_view
+    m = mask_bool.astype(np.uint8)
+    for _ in range(iterations):
+        win = sliding_window_view(m, (3, 3))
+        eroded = win.min(axis=(-2, -1))
+        e = np.zeros_like(m)
+        e[1:-1, 1:-1] = eroded
+        m = e
+    return m.astype(bool)
+
+
+# --------------------- Lifespan ---------------------
+def ensure_legacy_models():
+    """Ленивая загрузка SAM-2 + FLUX (только для режима legacy/zai на GPU).
+
+    Модульные backend'ы (cloudflare -> gemini -> local) не используют их и работают
+    на CPU, поэтому скачивание ~3 ГБ FLUX при старте нам не нужно — модели
+    загружаются только если кто-то явно выберет AI_BACKEND=legacy.
+    """
+    global _predictor, _pipe, _device
+    if _predictor is not None and _pipe is not None:
+        return
+    if torch is None or Flux2KleinInpaintPipeline is None:
+        raise RuntimeError(
+            "AI_BACKEND=legacy требует torch, diffusers, SAM-2 и локальные модели; "
+            "для API-режима используйте AI_BACKEND=cloudflare."
+        )
+    _device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Using device: {_device}")
+    if _predictor is None:
+        try:
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+            _predictor = SAM2ImagePredictor.from_pretrained(
+                SAM2_MODEL_NAME, device=_device, local_files_only=SAM2_LOCAL_FILES_ONLY
+            )
+            _predictor.model = _predictor.model.to(_device).eval()
+            logger.info("✅ SAM-2 Hiera-L loaded")
+        except Exception as e:
+            logger.error(f"❌ SAM-2 load error: {e}")
+            _predictor = None
+    if _pipe is None:
+        try:
+            _pipe = Flux2KleinInpaintPipeline.from_pretrained(
+                FLUX_MODEL_NAME,
+                torch_dtype=getattr(torch, FLUX_TORCH_DTYPE_NAME)
+            )
+            _pipe = _pipe.to(_device)
+            logger.info("✅ FLUX.2 [klein] 4B loaded")
+        except Exception as e:
+            logger.error(f"❌ FLUX.2 load error: {e}")
+            _pipe = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _device
+    _device = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
+    logger.info(f"Using device: {_device}")
+    logger.info("Recolor API started; recommended sam2-local backend uses SAM 2 for masks and deterministic local recoloring.")
+    yield
+
+    # Очистка при завершении
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logger.info("🧹 GPU cache cleared")
+
+
+app = FastAPI(title="AI Colorization API", version="2.0.0", lifespan=lifespan)
+
+app.state.limiter = limiter
+
+_predictor = None
+_pipe = None
+_device = "cpu"
+
+
+# --------------------- Проверка API-ключа ---------------------
+def verify_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
+    """Проверяет API-ключ из заголовка X-API-Key.
+
+    Если серверные ключи не заданы (VALID_API_KEYS пуст), проверка пропускается."""
+    if not VALID_API_KEYS:
+        return None
+    if not x_api_key:
+        logger.warning("⛔️ Rejected: no X-API-Key header received (expected %d key(s))", len(VALID_API_KEYS))
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    if x_api_key not in VALID_API_KEYS:
+        masked = x_api_key[:6] + "..." if len(x_api_key) > 6 else x_api_key[:1] + "..."
+        logger.warning(
+            "⛔️ Rejected: X-API-Key '%s' does not match any of %d valid key(s)",
+            masked,
+            len(VALID_API_KEYS),
+        )
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return x_api_key
+
+
+# --------------------- Подбор имени цвета ---------------------
+def get_color_hex_name(hex_color: int) -> str:
+    """Конвертирует HEX-цвет в точное читаемое английское название для промпта.
+    Использует lookup цветов CSS4/X11 с поиском ближайшего в RGB-пространстве."""
+    r = (hex_color >> 16) & 0xFF
+    g = (hex_color >> 8) & 0xFF
+    b = hex_color & 0xFF
+    mx = max(r, g, b)
+    mn = min(r, g, b)
+    sat = 0.0 if mx == 0 else (mx - mn) / mx
+
+    # Серые оттенки
+    if sat < 0.12:
+        val = mx / 255.0
+        if (r, g, b) in _EXACT_METAL_GRAYS:
+            return _EXACT_METAL_GRAYS[(r, g, b)]
+        if (r, g, b) in _EXACT_GRAYS:
+            return _EXACT_GRAYS[(r, g, b)]
+        for threshold, name in _GRAY_COLORS:
+            if val >= threshold:
+                return name
+        return "black"
+
+    # Находим ближайший цвет из таблицы по евклидову расстоянию в RGB
+    best_name = _CSS_NAMED_COLORS[0][1]
+    best_dist = float('inf')
+    for (cr, cg, cb), name in _CSS_NAMED_COLORS:
+        dr = r - cr
+        dg = g - cg
+        db = b - cb
+        dist = dr * dr + dg * dg + db * db
+        if dist < best_dist:
+            best_dist = dist
+            best_name = name
+
+    if best_name in _EXACT_COLOR_NAMES or best_dist < 2500:
+        return best_name
+
+    val = mx / 255.0
+    if val < 0.30:
+        return "very dark " + best_name
+    elif val < 0.45:
+        return "dark " + best_name
+    elif val > 0.80:
+        return "bright " + best_name
+    return best_name
+
+
+@app.get("/health")
+async def health():
+    from recolor.backends import BackendConfigurationError, get_backend
+    try:
+        backend = get_backend()
+    except BackendConfigurationError as exc:
+        # A deployment without provider credentials is not ready to accept work.
+        logger.warning("health: backend not configured — %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    generation_enabled = backend.name in {"cloudflare", "legacy"}
+    model_info = {"loaded": _predictor is not None and _pipe is not None,
+                  "model": None, "device": _device}
+    if backend.name == "sam2-local":
+        from recolor.sam2_segmenter import loaded_model_info
+        model_info = loaded_model_info()
+    logger.info(
+        "health: backend=%s generation_enabled=%s device=%s models_loaded=%s segmentation_model=%s",
+        backend.name, generation_enabled, model_info.get("device") or _device,
+        bool(model_info.get("loaded")), model_info.get("model"),
+    )
+    return {
+        "status": "healthy",
+        "device": model_info.get("device") or _device,
+        "models_loaded": bool(model_info.get("loaded")),
+        "segmentation_model": model_info.get("model"),
+        "backend": backend.name,
+        "generation_enabled": generation_enabled,
+        "recolor_mode": "masked-local-color-transform" if backend.name == "sam2-local" else "configured-backend",
+    }
+
+
+def run_recolor_job(
+    img_bytes: bytes,
+    point_x: float,
+    point_y: float,
+    material: str,
+    color_hex: str,
+    color_name: str,
+    object_name: str,
+    strength: float,
+    guidance_scale: float,
+    num_inference_steps: int,
+    patina: bool,
+    color_r: int | None = None,
+    color_g: int | None = None,
+    color_b: int | None = None,
+    from_pipette: bool = False,
+) -> bytes:
+    """Синхронная тяжёлая обработка одного запроса (декод, SAM-2, FLUX, кодирование PNG).
+
+    Вызывается напрямую из эндпоинта ``ai_recolor``.
+    """
+    ensure_legacy_models()
+    start_time = time.time()
+
+    # 1. Декодирование изображения
+    try:
+        source_image = Image.open(BytesIO(img_bytes))
+        source_image = ImageOps.exif_transpose(source_image)
+        source_image = source_image.convert("RGB")
+    except Exception as e:
+        logger.error(f"❌ PIL decode error: {e}")
+        raise HTTPException(400, f"Invalid image: {e}")
+    if source_image is None:
+        logger.error("❌ Failed to decode image: source_image is None")
+        raise HTTPException(400, "Failed to decode image")
+    w, h = source_image.size
+    logger.info(f"   Image dimensions: {w}x{h} (EXIF orientation applied server-side)")
+
+    # Ресайз до разумного размера (макс. 1024x1024) для стабильности
+    if w > MAX_INFERENCE_SIZE or h > MAX_INFERENCE_SIZE:
+        source_image.thumbnail((MAX_INFERENCE_SIZE, MAX_INFERENCE_SIZE))
+        if source_image is None:
+            logger.error("❌ source_image became None after thumbnail")
+            raise HTTPException(500, "Internal error: image resize failed")
+        new_w, new_h = source_image.size
+        logger.info(f"   Resized to: {new_w}x{new_h}")
+    else:
+        logger.info("   No resize needed")
+
+    source_image_np = np.array(source_image)
+    logger.info(f"   Image array shape: {source_image_np.shape}")
+    image_height, image_width = source_image_np.shape[:2]
+    image_area = image_width * image_height
+
+    scale_x = source_image.width / w
+    scale_y = source_image.height / h
+
+    logger.info(f"   Resize scale: scale_x={scale_x:.4f}, scale_y={scale_y:.4f}")
+
+    scaled_point_x = int(point_x * scale_x)
+    scaled_point_y = int(point_y * scale_y)
+    logger.info(f"   Scaled prompt point: ({point_x}, {point_y}) -> ({scaled_point_x}, {scaled_point_y})")
+    point_x = scaled_point_x
+    point_y = scaled_point_y
+
+    # 2. Преобразование color_hex
+    color_hex_int = parse_rgb_color(color_hex)
+    logger.info(f"   Parsed color_hex_int: {color_hex_int}")
+
+    # Проверяем, что source_image всё ещё валидна после всех операций
+    logger.info(f"   source_image type before generation: {type(source_image)}, size: {source_image.size if source_image else 'N/A'}")
+    if source_image is None:
+        logger.error("❌ source_image is None before generation")
+        raise HTTPException(500, "Internal error: source_image is None before generation")
+
+    # 3. Сегментация SAM-2 с consistency-check (прогоны с джиттер-точками)
+    seg_start = time.time()
+
+    jitter_points = []
+    for dx, dy in SAM2_JITTER_OFFSETS:
+        jx = max(0, min(image_width - 1, point_x + dx))
+        jy = max(0, min(image_height - 1, point_y + dy))
+        jitter_points.append((jx, jy))
+
+    all_mask_candidates = []
+    all_scores = []
+    all_coords = [(point_x, point_y)] + jitter_points
+
+    with torch.no_grad():
+        if hasattr(_predictor, 'reset_state'):
+            _predictor.reset_state()
+        _predictor.set_image(source_image_np)
+
+        for cx, cy in all_coords:
+            masks, scores, logits = _predictor.predict(
+                point_coords=np.array([[cx, cy]]),
+                point_labels=np.array([1]),
+                multimask_output=True,
+            )
+            best_idx_local = np.argmax(scores)
+            all_mask_candidates.append(masks[best_idx_local])
+            all_scores.append(scores[best_idx_local])
+            logger.info(f"   SAM-2: point=({cx}, {cy}), best mask score={scores[best_idx_local]:.3f}")
+
+    # Находим финальную маску по максимальному среднему IoU (запасной вариант)
+    best_mask_idx = 0
+    best_mean_iou = 0.0
+    for i, mask_i in enumerate(all_mask_candidates):
+        ious = [mask_iou(mask_i, all_mask_candidates[j]) for j in range(len(all_mask_candidates)) if j != i]
+        mean_iou = sum(ious) / len(ious) if ious else 0.0
+        if mean_iou > best_mean_iou:
+            best_mean_iou = mean_iou
+            best_mask_idx = i
+
+    single_best_mask = all_mask_candidates[best_mask_idx]
+
+    # Консенсусная маска: пиксель остаётся, только если его выбрало
+    # большинство джиттер-прогонов. Нестабильный «ореол» вокруг тонких
+    # объектов (провода на стене) отсекается, крупные объекты сохраняются.
+    votes = np.stack(all_mask_candidates).sum(axis=0).astype(np.float32)
+    vote_fraction = votes / len(all_mask_candidates)
+    consensus_mask = _morph_erode((vote_fraction >= SAM2_MASK_CONSENSUS), iterations=1)
+
+    single_area = float(np.sum(single_best_mask))
+    if consensus_mask.sum() < SAM2_MASK_CONSENSUS_MIN_RATIO * single_area:
+        logger.warning(
+            f"⚠️  Consensus mask too small ({consensus_mask.sum()} vs single {single_area:.0f}) "
+            f"— falling back to single best mask"
+        )
+        best_mask = single_best_mask
+    else:
+        best_mask = consensus_mask
+    logger.info(f"   Mask: single_best_area={single_area:.0f}, consensus_area={float(best_mask.sum()):.0f}")
+    mask_area = np.sum(best_mask)
+    mask_area_percent = mask_area / (image_width * image_height) * 100
+
+    logger.info(f"   SAM-2: final mask from point {all_coords[best_mask_idx]}, score={all_scores[best_mask_idx]:.3f}")
+    logger.info(f"   SAM-2: mask area={mask_area} pixels ({mask_area_percent:.2f}% of image), mean IoU={best_mean_iou:.3f}")
+
+    # Проверка стабильности сегментации
+    if best_mean_iou < SAM2_MIN_CONSISTENCY_IOU:
+        logger.warning(f"⚠️  Low mask consistency (mean IoU={best_mean_iou:.3f} < {SAM2_MIN_CONSISTENCY_IOU}) — point may be near object boundary")
+
+    if mask_area < SAM2_MIN_MASK_AREA:
+        logger.warning("⚠️  Mask area is very small – object might not be detected!")
+
+    seg_time = time.time() - seg_start
+    logger.info(f"   Segmentation took {seg_time:.2f}s ({len(all_coords)} runs with consistency-check)")
+
+    # 4. Формирование промпта с цветом (именованное название) и названием объекта
+    if color_name and color_name != "":
+        color_name = color_name
+    else:
+        color_name = get_color_hex_name(color_hex_int)
+    hex_color_str = f"#{color_hex_int:06x}"
+
+    if None not in (color_r, color_g, color_b):
+        exact_color_desc = f"{hex_color_str} (RGB {color_r}, {color_g}, {color_b})"
+    else:
+        exact_color_desc = hex_color_str
+
+    # Flat-matte только когда материал реально «без текстуры».
+    if material == "no_texture":
+        prompt = f"The {object_name} is recolored to {exact_color_desc}, same shape, flat {color_name} color, hex {hex_color_str}, no texture, smooth matte surface, photorealistic"
+    elif material == "metal":
+        if color_name in EXACT_METAL_NAMES:
+            prompt_template = MATERIAL_PROMPTS.get(color_name, MATERIAL_PROMPTS["metal"])
+        elif color_name in BRIGHT_COLORS:
+            prompt_template = MATERIAL_PROMPTS["metal"].replace("bright ", "").replace("vivid ", "")
+        else:
+            prompt_template = MATERIAL_PROMPTS["bronze"] if color_name == "bronze" else MATERIAL_PROMPTS["metal"]
+        prompt = prompt_template.format(color=exact_color_desc, object=object_name)
+    else:
+        prompt_template = MATERIAL_PROMPTS.get(material, DEFAULT_PROMPT)
+        if color_name in BRIGHT_COLORS:
+            prompt_template = prompt_template.replace("bright ", "").replace("vivid ", "")
+        prompt = prompt_template.format(color=exact_color_desc, object=object_name)
+
+    # Эффект старения (патина) для металла
+    if material == "metal" and patina:
+        prompt += ", with aged patina finish, weathered oxidation, antique worn metal, subtle verdigris and brown patina, realistic aging, uneven discolored surface"
+
+    logger.info(f"   object_name: '{object_name}', color_name: '{color_name}', color_hex: '{hex_color_str}'")
+    logger.info(f"   Prompt: {prompt}")
+
+    # 5. Создание маски PIL
+    mask_pil = Image.fromarray((best_mask * 255).astype(np.uint8), mode='L')
+    if mask_pil is None:
+        logger.error("❌ mask_pil is None before generation")
+        raise HTTPException(500, "Internal error: mask generation failed")
+
+    # Используем параметры из запроса с разумными ограничениями.
+    # Примечание: Flux2KleinInpaintPipeline — guidance-distilled модель; для неё
+    # guidance_scale > 1.0 игнорируется (см. do_classifier_free_guidance в исходниках).
+    effective_steps = min(FLUX_MAX_STEPS, int(num_inference_steps))
+    effective_guidance = guidance_scale if guidance_scale > 0 else 1.0
+    effective_strength = strength if strength is not None else FLUX_DEFAULT_STRENGTH
+
+    gen_start = time.time()
+    logger.info(
+        f"   Generation params: guidance_scale={effective_guidance}, steps={effective_steps}, strength={effective_strength}, prompt='{prompt}'"
+    )
+    logger.info(f"🎨 Running FLUX.2 inference: steps={effective_steps}, guidance={effective_guidance}, strength={effective_strength}, image_size={source_image.size}")
+
+    try:
+        result = _pipe(
+            image=source_image,
+            mask_image=mask_pil,
+            prompt=prompt,
+            guidance_scale=effective_guidance,
+            num_inference_steps=effective_steps,
+            strength=effective_strength,
+            generator=torch.Generator(_device).manual_seed(secrets.randbelow(2**32)),
+        ).images[0]
+    except torch.cuda.OutOfMemoryError as e:
+        logger.error(f"❌ CUDA OOM: {e}. Try lower resolution or enable_sequential_cpu_offload()")
+        raise HTTPException(500, "GPU out of memory. Try lowering the image resolution.")
+    except Exception as e:
+        logger.error(f"❌ Generation error: {e}")
+        raise HTTPException(500, f"Generation failed: {e}")
+
+    gen_time = time.time() - gen_start
+    logger.info(f"   Generation took {gen_time:.2f}s")
+
+    # 8. Точная подгонка цвета под пипетку
+    if from_pipette and None not in (color_r, color_g, color_b) and best_mask is not None:
+        try:
+            result_np = np.array(result, dtype=np.float32)
+            mask = best_mask.astype(bool)
+            target = np.array([color_r, color_g, color_b], dtype=np.float32)
+            region = result_np[mask]
+            if region.size > 0:
+                mean = region.mean(axis=0)
+                # Защита от деления на ~0 (почти чёрный регион)
+                mean_safe = np.where(mean < 1.0, 1.0, mean)
+                # Мультипликативная коррекция (white balance) вместо плоского
+                # аддитивного сдвига: масштабирует каждый канал, сохраняя
+                # структуру/текстуру региона и меняя баланс каналов под цель.
+                ratio = target / mean_safe
+                k = 0.9
+                corrected = region * (1.0 - k + k * ratio)
+                result_np[mask] = np.clip(corrected, 0, 255)
+                result = Image.fromarray(result_np.astype(np.uint8))
+                logger.info(f"   Applied pipette white-balance match to target {target.tolist()} (ratio={ratio.tolist()})")
+        except Exception as e:
+            logger.warning(f"⚠️  Pipette color-match skipped: {e}")
+
+    # 9. Возврат PNG
+    buf = BytesIO()
+    result.save(buf, format="PNG")
+    buf.seek(0)
+
+    # Очистка памяти после обработки
+    del source_image_np
+    del masks, scores, logits, best_mask
+    del source_image, mask_pil, result
+
+    response_content = buf.getvalue()
+    buf.close()
+
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
+
+    total_time = time.time() - start_time
+    logger.info(f"✅ Recolor job finished in {total_time:.2f}s")
+
+    return response_content
+
+
+def run_legacy_recolor_job(recolor_request):
+    """Adapt the legacy SAM-2/FLUX routine to the modular BackendResult contract."""
+    from recolor.base import BackendResult, RecolorRequest
+
+    if not isinstance(recolor_request, RecolorRequest):
+        raise TypeError("legacy backend expects a RecolorRequest")
+    src = np.asarray(recolor_request.image_rgb, dtype=np.uint8)
+    encoded = BytesIO()
+    Image.fromarray(src, mode="RGB").save(encoded, format="PNG")
+    generated_bytes = run_recolor_job(
+        img_bytes=encoded.getvalue(),
+        point_x=recolor_request.point_x,
+        point_y=recolor_request.point_y,
+        material=recolor_request.material,
+        color_hex=f"#{recolor_request.color_hex:06X}",
+        color_name=recolor_request.color_name,
+        object_name=recolor_request.object_name,
+        strength=recolor_request.strength,
+        guidance_scale=recolor_request.guidance_scale,
+        num_inference_steps=recolor_request.num_inference_steps,
+        patina=recolor_request.patina,
+        color_r=recolor_request.color_r,
+        color_g=recolor_request.color_g,
+        color_b=recolor_request.color_b,
+        from_pipette=recolor_request.from_pipette,
+    )
+    with Image.open(BytesIO(generated_bytes)) as generated:
+        output = np.asarray(generated.convert("RGB"), dtype=np.uint8)
+    if output.shape != src.shape:
+        output = np.asarray(
+            Image.fromarray(output, mode="RGB").resize(
+                (src.shape[1], src.shape[0]), Image.Resampling.LANCZOS
+            ),
+            dtype=np.uint8,
+        )
+    return BackendResult(
+        image_rgb=output,
+        backend="legacy",
+        object_label=recolor_request.object_name,
+        notes=["legacy SAM-2/FLUX pipeline"],
+    )
+
+
+@app.post("/ai-recolor", dependencies=[Depends(rate_limit_recolor)])
+async def ai_recolor(
+    request: Request,
+    image: UploadFile = File(...),
+    point_x: float = Form(...),
+    point_y: float = Form(...),
+    material: str = Form("wood"),
+    color_hex: str = Form("0x8B4513"),
+    color_name: str = Form(""),
+    color_r: int | None = Form(None),
+    color_g: int | None = Form(None),
+    color_b: int | None = Form(None),
+    object_name: str = Form("object"),
+    strength: float = Form(FLUX_DEFAULT_STRENGTH),
+    guidance_scale: float = Form(FLUX_DEFAULT_GUIDANCE_SCALE),
+    num_inference_steps: int = Form(FLUX_DEFAULT_NUM_INFERENCE_STEPS),
+    patina: bool = Form(False),
+    from_pipette: bool = Form(False),
+    negative_points: str = Form("[]"),
+    api_key: str | None = Depends(verify_api_key),
+):
+    start_time = time.time()
+    client_ip = request.client.host if request.client else "unknown"
+    has_api_key = "x-api-key" in {k.lower() for k in request.headers}
+    logger.info("📥 ===== NEW REQUEST =====")
+    logger.info("   Client IP: %s", client_ip)
+    logger.info("   X-API-Key header present: %s", has_api_key)
+    logger.info(
+        "   Request params: point_x=%s point_y=%s material=%s color_hex=%s color_name=%s "
+        "color_rgb=(%s,%s,%s) object_name=%s strength=%s guidance_scale=%s "
+        "steps=%s patina=%s from_pipette=%s",
+        point_x, point_y, material, color_hex, color_name,
+        color_r, color_g, color_b, object_name, strength, guidance_scale,
+        num_inference_steps, patina, from_pipette,
+    )
+
+    # --- Валидация входящих параметов (защита от аномальных значений/DoS) ---
+    for _name, _val in (
+        ("point_x", point_x), ("point_y", point_y),
+        ("strength", strength), ("guidance_scale", guidance_scale),
+    ):
+        if not math.isfinite(_val):
+            logger.warning(f"⚠️ Validation failed: parameter '{_name}' is not finite")
+            raise HTTPException(400, f"Parameter '{_name}' must be a finite number")
+
+    if not (0 <= point_x <= MAX_IMAGE_DIMENSION) or not (0 <= point_y <= MAX_IMAGE_DIMENSION):
+        logger.warning(f"⚠️ Validation failed: point out of range ({point_x}, {point_y})")
+        raise HTTPException(400, "point_x/point_y out of allowed range")
+
+    strength = float(min(1.0, max(0.1, strength)))
+    guidance_scale = float(min(20.0, max(1.0, guidance_scale)))
+    if num_inference_steps < 6 or num_inference_steps > 50:
+        logger.warning(f"⚠️ num_inference_steps={num_inference_steps} out of range, clamping to [6,50]")
+    num_inference_steps = int(min(50, max(6, num_inference_steps)))
+
+    if material not in ALLOWED_MATERIALS:
+        logger.warning(f"⚠️ Unknown material '{material}', falling back to 'wood'")
+        material = "wood"
+
+    object_name = sanitize_prompt_text(object_name)
+
+    if guidance_scale < FLUX_MIN_GUIDANCE_SCALE:
+        logger.warning(f"⚠️ guidance_scale={guidance_scale} too low, clamping to {FLUX_FALLBACK_GUIDANCE_SCALE}")
+        guidance_scale = FLUX_FALLBACK_GUIDANCE_SCALE
+
+    img_bytes = await image.read()
+    logger.info(f"   Image size: {len(img_bytes)} bytes")
+
+    if len(img_bytes) > MAX_IMAGE_SIZE_BYTES:
+        logger.warning(
+            f"⚠️ Image too large: {len(img_bytes)} bytes "
+            f"(limit {MAX_IMAGE_SIZE_BYTES} bytes)"
+        )
+        raise HTTPException(
+            413,
+            f"Image too large. Maximum allowed size is "
+            f"{MAX_IMAGE_SIZE_BYTES // (1024 * 1024)} MB.",
+        )
+
+    try:
+        from recolor.backends import get_backend
+        from recolor.base import RecolorRequest
+
+        # Декодируем и ресайзим до максимального размера инференса.
+        try:
+            source_image = Image.open(BytesIO(img_bytes))
+            source_image = ImageOps.exif_transpose(source_image).convert("RGB")
+        except Exception as exc:
+            raise HTTPException(400, "Invalid image file") from exc
+        ow, oh = source_image.size
+        if not (0 <= point_x < ow and 0 <= point_y < oh):
+            raise HTTPException(400, "Tap point is outside the uploaded image")
+
+        # Optional negative SAM 2 points protect details such as camera lenses,
+        # a monitor display, logos, and labels. Input is JSON [[x, y], ...].
+        try:
+            parsed_negative_points = json.loads(negative_points or "[]")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise HTTPException(400, "negative_points must be a JSON array of [x, y] pairs") from exc
+        if not isinstance(parsed_negative_points, list) or len(parsed_negative_points) > 32:
+            raise HTTPException(400, "negative_points must be a list containing at most 32 points")
+        clean_negative_points: list[tuple[float, float]] = []
+        for item in parsed_negative_points:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise HTTPException(400, "Each negative point must be [x, y]")
+            try:
+                nx, ny = float(item[0]), float(item[1])
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, "Negative point coordinates must be numbers") from exc
+            if not (math.isfinite(nx) and math.isfinite(ny)):
+                raise HTTPException(400, "Negative point coordinates must be finite")
+            if not (0 <= nx < ow and 0 <= ny < oh):
+                raise HTTPException(400, "A protected point is outside the uploaded image")
+            clean_negative_points.append((nx, ny))
+
+        if ow > MAX_INFERENCE_SIZE or oh > MAX_INFERENCE_SIZE:
+            source_image.thumbnail((MAX_INFERENCE_SIZE, MAX_INFERENCE_SIZE))
+        nw, nh = source_image.size
+        sx = (nw / ow) if ow else 1.0
+        sy = (nh / oh) if oh else 1.0
+        point_x = int(point_x * sx)
+        point_y = int(point_y * sy)
+        scaled_negative_points = [
+            (float(np.clip(int(nx * sx), 0, nw - 1)), float(np.clip(int(ny * sy), 0, nh - 1)))
+            for nx, ny in clean_negative_points
+        ]
+        logger.info(
+            "   Image decoded: %dx%d -> %dx%d (scale %.3fx) point=(%d,%d) protected_points=%d",
+            ow, oh, nw, nh, sx, point_x, point_y, len(scaled_negative_points),
+        )
+
+        color_hex_int = parse_rgb_color(color_hex)
+        logger.info(
+            "   Color: hex=%s -> int=%d (0x%06X) rgb=(%s,%s,%s) name=%s",
+            color_hex, color_hex_int, color_hex_int, color_r, color_g, color_b, color_name,
+        )
+
+        request = RecolorRequest(
+            image_rgb=np.array(source_image),
+            point_x=float(point_x),
+            point_y=float(point_y),
+            material=material,
+            color_r=color_r or 0,
+            color_g=color_g or 0,
+            color_b=color_b or 0,
+            color_hex=color_hex_int,
+            color_name=color_name,
+            object_name=object_name,
+            patina=patina,
+            from_pipette=from_pipette,
+            strength=strength,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+            negative_points=scaled_negative_points,
+        )
+
+        backend = get_backend()
+        logger.info(f"▶ Using backend: {backend.name}")
+        result = backend.run(request)
+
+        result_image = np.asarray(result.image_rgb, dtype=np.uint8)
+        if result_image.size == 0 or result_image.shape[0] == 0 or result_image.shape[1] == 0:
+            logger.error(
+                "Backend %s returned empty image (backend=%s notes=%s)",
+                backend.name, result.backend, result.notes,
+            )
+            raise HTTPException(
+                500,
+                "Backend returned an empty result; check server logs for segmentation errors.",
+            )
+
+        out_img = Image.fromarray(result_image)
+        buf = BytesIO()
+        out_img.save(buf, format="PNG")
+        buf.seek(0)
+        response_content = buf.getvalue()
+        logger.info(
+            "✅ Request completed in %.2fs total — backend=%s output=%dx%d bytes=%d",
+            time.time() - start_time, result.backend,
+            out_img.width, out_img.height, len(response_content),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        total_time = time.time() - start_time
+        logger.error(f"❌ Request failed after {total_time:.2f}s: {e}")
+        logger.error(traceback.format_exc())
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        from recolor.backends import BackendConfigurationError
+        from recolor.cloudflare_ai import CloudflareAIError
+        from recolor.sam2_segmenter import Sam2UnavailableError
+        if isinstance(e, BackendConfigurationError):
+            logger.error("Backend configuration error: %s", e)
+            raise HTTPException(503, str(e)) from e
+        if isinstance(e, Sam2UnavailableError):
+            logger.error(
+                "SAM 2 recolor request could not be completed: %s "
+                "(check SAM 2 model download/cache, server RAM, and server logs)",
+                e,
+            )
+            raise HTTPException(
+                503,
+                "Object segmentation is temporarily unavailable. Check SAM 2 model download/cache, server RAM, and server logs.",
+            ) from e
+        if isinstance(e, CloudflareAIError):
+            # Provider failures stay visible in logs, not leaked verbatim to app clients.
+            status = 503 if e.status == 429 else 502
+            detail = "Image generation service failed. Check Cloudflare credentials, model access, quota, and server logs."
+            raise HTTPException(status, detail) from e
+        logger.error("Unhandled exception type=%s: %s", type(e).__name__, e)
+        raise HTTPException(500, "Image processing failed; check server logs.") from e
+
+    total_time = time.time() - start_time
+    logger.info(f"✅ Request completed in {total_time:.2f}s total")
+    return Response(content=response_content, media_type="image/png", headers={
+        "X-Recolor-Backend": result.backend,
+        "X-Recolor-Generation": "true" if result.backend == "cloudflare" else "false",
+    })
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)

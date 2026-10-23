@@ -1,0 +1,79 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+.Python
+.venv/
+venv/
+env/
+.server/
+
+# --- Dependencies (если используются в IDE) ---
+.eggs/
+.eggs/
+develop-eggs/
+dist/
+build/
+downloads/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- Pytest ---
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Environment files (НИКОГДА не коммитить секреты!) ---
+.env
+.env.*
+!.env.example
+.env.bak
+
+# --- HuggingFace cache / модели ---
+hf_cache/
+model_cache/
+.server_models/
+models/
+.huggingface/
+~/.cache/huggingface/
+
+# --- Debug output ---
+debug_output/
+logs/
+*.log
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+lsp/.vs-code/
+
+# --- OS ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# --- Docker ---
+.docker/
+
+# --- Git ---
+.git
