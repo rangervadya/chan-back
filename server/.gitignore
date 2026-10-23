@@ -18,7 +18,7 @@ dist/
 build/
 downloads/
 eggs/
-lib/
+/lib/
 lib64/
 parts/
 sdist/
@@ -44,7 +44,7 @@ htmlcov/
 hf_cache/
 model_cache/
 .server_models/
-models/
+/models/
 .huggingface/
 ~/.cache/huggingface/
 
@@ -77,3 +77,13 @@ Thumbs.db
 
 # --- Git ---
 .git
+
+# Flutter / Dart
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.pub-cache/
+**/.pub/
+**/ios/Pods/
+**/ios/Flutter/.last_build_id
+**/android/.gradle/
