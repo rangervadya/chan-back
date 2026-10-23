@@ -487,7 +487,7 @@ class CloudflareBackend(_AnalyzingMixin):
             painted_ai=painted, original=image, mask=mask,
             target_rgb=request.target_rgb, material=request.material,
             feather_px=_cfg("MASK_FEATHER_PX", 2.0), request=request,
-            ai_texture_influence=float(_cfg("CLOUDFLARE_AI_TEXTURE_INFLUENCE", 0.12)),
+            ai_texture_influence=float(_cfg("CLOUDFLARE_AI_TEXTURE_INFLUENCE", 0.18)),
         )
         finish_time = time.monotonic() - t_gen - gen_time
         diag.capture("05_detail_restored", out, note="после восстановления деталей и коррекции цвета")
@@ -831,13 +831,7 @@ def _color_name(request: RecolorRequest) -> str:
 
 
 def build_recolor_prompt(request: RecolorRequest, object_label: str, color_name: str) -> str:
-    """Build a material-aware, photorealistic recoloring prompt.
-
-    The prompt asks the generator to retain clearly visible material response
-    (grain, weave, pores, roughness and highlights) rather than flattening the
-    selected surface into a uniform color. Geometry and unselected areas remain
-    protected by the downstream mask-based composition.
-    """
+    """Build a material-aware recoloring prompt with clearly visible surface cues."""
     material = _normalize_material(getattr(request, "material", "object"))
     color = str(
         color_name
@@ -866,88 +860,105 @@ def build_recolor_prompt(request: RecolorRequest, object_label: str, color_name:
     if not label or label.lower() in {"object", "selected object", "unknown object"}:
         label = f"{material} object" if material not in {"", "object"} else "selected object"
 
-    # Each material rule explicitly protects the visual cues that make the
-    # surface read as that material. Avoid instructions that flatten texture.
+    # Ask for materially legible texture, rather than just naming the material.
+    # Avoid inventing new geometry or arbitrary patterns.
     if material == "no_texture":
         material_rule = (
-            "Use a clean, uniform matte surface by design. Do not add grain, weave, pores, gloss, "
-            "patterns or decorative details; retain the original shape, edges and natural shading."
+            "This is intentionally a clean, uniform matte surface. Keep it smooth and matte; "
+            "do not add grain, weave, pores, gloss, patterns or decorative details. Preserve "
+            "the source lighting and all edges."
         )
     elif material == "wood":
         material_rule = (
-            "The surface must still read unmistakably as real wood: keep the existing grain lines, "
-            "knots, pores, scratches and wear clearly visible through the new color. Preserve natural "
-            "grain contrast and directional variation; do not replace the wood grain with a flat fill "
-            "or invent a new pattern."
+            "Make the surface read clearly as real wood at normal viewing size. The directional "
+            "wood grain must remain plainly visible, with natural long grain lines, growth-ring "
+            "variation where present, pores, knots and worn edges. Keep believable lighter and "
+            "darker grain contrast beneath the requested hue; do not wash the grain out or turn "
+            "the wood into a smooth painted plastic surface. Follow the source grain direction and "
+            "do not invent knots or a repeating fake pattern."
         )
     elif material == "fabric":
         material_rule = (
-            "The surface must still read as real fabric: retain visible weave/fibres, folds, seams, "
-            "stitching and soft light response. Do not flatten the weave into a smooth solid color, "
-            "and do not invent a printed pattern."
+            "Make the surface read clearly as real fabric. Keep the woven thread structure or "
+            "fibres visibly legible, including small interlaced strands, soft fuzz where present, "
+            "stitching, seams and natural folds. Preserve fabric-specific soft highlights and "
+            "micro-shadows; do not flatten the weave into a solid smooth color or invent a print."
         )
     elif material == "leather":
         material_rule = (
-            "The surface must still read unmistakably as real leather: retain and clearly show its "
-            "natural fine grain, pores, creases, stitching, edge wear and subtle roughness. Preserve "
-            "the natural variation between highlights and recessed grain so the result does not look "
-            "like a flat digital color overlay or smooth plastic. Do not add logos, patterns or new seams."
+            "Make the surface read clearly as genuine leather, not smooth plastic. Its fine pebble "
+            "grain, tiny pores, natural creases, irregular grain spacing, edge wear and stitching "
+            "should be plainly visible with realistic micro-shadowing. Strengthen the visibility of "
+            "these leather cues moderately if they are faint in the source, while keeping the same "
+            "grain scale and avoiding exaggerated bumps, fake repeating patterns, new seams or logos. "
+            "Keep a believable leather sheen rather than a flat digital paint layer."
         )
     elif material == "glass":
         material_rule = (
-            "Tint only the existing visible glass. Preserve transparency, refraction, reflections, "
-            "rim highlights and the original scene visible through it. The tint must follow the glass "
-            "surface and must not color the background seen through the glass."
+            "Make the surface read as real glass through physically plausible transparency, refraction, "
+            "edge thickness, rim highlights and reflections. Keep the original scene visible through "
+            "the glass. Apply the requested tint to the glass only; never tint the background seen "
+            "through it, and do not make the glass opaque or plastic-like."
         )
     elif material in {"metal", "bronze"} or material in _METALLIC_VARIANTS:
         material_rule = (
-            "The surface must still read as real metal: preserve the existing roughness, brushed or "
-            "polished finish, specular highlights, reflections, scratches and wear. Keep realistic "
-            "bright highlights and dark reflections; do not flatten the metal into a matte color fill."
+            "Make the surface read unmistakably as real metal. Preserve or clarify the source's "
+            "brushed grain, polished reflectivity, directional specular streaks, crisp bright "
+            "highlights and deep reflected shadows. Metal must have a strong but realistic "
+            "highlight-to-shadow contrast and cannot look like flat matte paint. Retain existing "
+            "scratches and wear; do not invent engraving, dents or a different finish."
         )
     elif material == "plastic":
         material_rule = (
-            "Preserve the actual plastic finish (matte or glossy), molded details, edge highlights, "
-            "reflections and wear. Keep the surface response visible instead of using a flat color fill; "
-            "do not change the object's design."
+            "Make the surface read as the same type of real plastic as the source: visibly preserve "
+            "its matte or glossy response, smooth molded transitions, subtle fine surface texture, "
+            "edge highlights and realistic reflections. Keep those highlights and micro-contrast "
+            "visible under the new hue; do not flatten it into a featureless color fill or add fake grain."
         )
     elif material == "ceramic":
         material_rule = (
-            "Preserve the ceramic body, glaze, realistic gloss, reflections and tiny surface "
-            "imperfections. Keep the glaze response visible under the new hue without adding decoration."
+            "Make the surface read as glazed or unglazed ceramic according to the source. Preserve "
+            "the glaze response, coherent specular highlights, subtle pores or tiny imperfections "
+            "where present, and the transition between bright and shaded areas. Do not flatten the "
+            "surface or add decorative patterns."
         )
     elif material == "concrete":
         material_rule = (
-            "Preserve visible concrete pores, aggregate, roughness, small cracks, chips and wear. "
-            "Keep the surface relief and its light/shadow contrast visible; do not smooth it into a flat fill."
+            "Make the surface read clearly as real concrete or cement. The small mineral aggregate, "
+            "pores, pits, grainy roughness, tiny chips and weathering must remain visible, with varied "
+            "micro-shadows and restrained natural irregularity. Do not smooth the texture away, make "
+            "the surface look like flat paint, or invent large cracks or new damage."
         )
     else:
         material_rule = (
-            "Preserve and clearly show the object's existing material cues, microtexture, finish, "
-            "wear, highlights and shadows. The new color must not turn the surface into a flat uniform overlay."
+            "Clearly retain the source object's real material signature: visible microtexture, "
+            "surface roughness, appropriate highlights, reflections and natural wear. Make these cues "
+            "readable at normal viewing size without adding arbitrary patterns or changing geometry; "
+            "the requested hue must not become a flat uniform overlay."
         )
 
     prompt = (
         "PHOTOREALISTIC MATERIAL-AWARE COLOR EDIT. input_image_0 is the original photograph. "
-        "input_image_1 is a binary selection map: white marks the selected surface and black marks "
-        "areas to preserve. Use the original photograph as the source; this is an edit of the same "
-        "photograph, not a new scene. Change the color of the existing selected "
-        f"{label} to {color} (HEX {hex_color}, RGB {rgb}). "
-        "The requested change is the surface color, not a redesign. The selected object must remain "
-        "photorealistic, and its material texture and physically plausible surface response must remain "
-        "clearly visible under the new hue. Do not apply a smooth, uniform digital paint layer. "
+        "input_image_1 is the binary selection map: white marks the selected object surface and "
+        "black marks areas to preserve. Edit the same photograph, not a new scene. Change the "
+        f"surface color of the selected {label} to {color} (HEX {hex_color}, RGB {rgb}). "
+        "The target hue must be clearly recognizable, but the surface must still look like a real "
+        "photographed material, not a digitally painted flat area. Material texture and physically "
+        "plausible surface response should be clearly visible at normal viewing size, with sufficient "
+        "local contrast to read naturally. "
         f"{material_rule} "
-        "Preserve the exact identity, silhouette, proportions, geometry, components, joints, edges, "
-        "seams, accessories, position, orientation, camera angle and perspective. Keep lighting, "
-        "luminance gradients, natural shadows, highlights and reflections consistent with the source. "
-        "Do not add or remove objects, lettering, logos, seams or decorative patterns. Do not reshape, "
-        "smooth, sharpen or redesign the object. Do not alter any unselected area or the background. "
-        "If instructions conflict, preserving the source geometry and photograph takes priority."
+        "Preserve the exact object identity, silhouette, proportions, geometry, components, joints, "
+        "edges, seams, accessories, position, orientation, camera angle and perspective. Keep the "
+        "original lighting direction and broad shading consistent; retain realistic local highlights, "
+        "shadows and surface relief. Do not add or remove objects, lettering, logos, seams or "
+        "decorative patterns. Do not reshape the object or alter any unselected area or background. "
+        "Prioritize material realism and visible existing surface detail while keeping the same object "
+        "and the same photograph."
     )
     if material in {"metal", "bronze"} and bool(getattr(request, "patina", False)):
         prompt += (
-            " Add only a subtle, physically plausible aged metal patina that follows the existing "
-            "surface relief; do not change geometry, design or engraved details."
+            " Add subtle, physically plausible aged metal patina that follows the existing surface "
+            "relief; preserve the main metal reflections, geometry, design and engraved details."
         )
 
     logger.info(
@@ -955,7 +966,6 @@ def build_recolor_prompt(request: RecolorRequest, object_label: str, color_name:
         material, color, label, len(prompt),
     )
     return prompt
-
 
 # Backwards compatibility with the earlier internal function name.
 build_inpaint_prompt = build_recolor_prompt
@@ -1101,7 +1111,7 @@ def _hybrid_finish(
             255,
         )
 
-    influence = float(np.clip(ai_texture_influence, 0.0, 0.20))
+    influence = float(np.clip(ai_texture_influence, 0.0, 0.28))
     if influence > 0 and material_key != "no_texture":
         ai = np.asarray(painted_ai)
         if ai.dtype != np.uint8:
@@ -1115,17 +1125,20 @@ def _hybrid_finish(
         if ai is not None:
             ai_lab = cv2.cvtColor(ai, cv2.COLOR_RGB2LAB).astype(np.float32)
 
-            # Chroma texture: keep the AI contribution centred on the target hue;
-            # only its local variation around the selected-region median is added.
-            # Smaller smoothing radius keeps grain/weave visible instead of blurring it away.
-            sigma_chroma = max(1.2, min(src.shape[:2]) / 220.0)
-            ai_a = cv2.GaussianBlur(ai_lab[..., 1], (0, 0), sigmaX=sigma_chroma, sigmaY=sigma_chroma)
-            ai_b = cv2.GaussianBlur(ai_lab[..., 2], (0, 0), sigmaX=sigma_chroma, sigmaY=sigma_chroma)
+            # Chroma texture: preserve the requested average hue, but give the generated
+            # material detail enough local colour variation to be visible.
+            sigma_chroma = max(0.8, min(src.shape[:2]) / 420.0)
+            ai_a = cv2.GaussianBlur(
+                ai_lab[..., 1], (0, 0), sigmaX=sigma_chroma, sigmaY=sigma_chroma
+            )
+            ai_b = cv2.GaussianBlur(
+                ai_lab[..., 2], (0, 0), sigmaX=sigma_chroma, sigmaY=sigma_chroma
+            )
             chroma_scale = {
-                "metal": 0.28, "bronze": 0.28, "wood": 0.22, "leather": 0.30,
-                "fabric": 0.28, "plastic": 0.16, "glass": 0.08,
-                "ceramic": 0.16, "concrete": 0.24,
-            }.get(material_key, 0.18) * min(1.5, influence / 0.08)
+                "metal": 0.34, "bronze": 0.34, "wood": 0.30, "leather": 0.38,
+                "fabric": 0.36, "plastic": 0.22, "glass": 0.10,
+                "ceramic": 0.23, "concrete": 0.32,
+            }.get(material_key, 0.22) * min(1.75, influence / 0.08)
             for channel, smooth in ((1, ai_a), (2, ai_b)):
                 vals = smooth[m]
                 if vals.size == 0:
@@ -1140,24 +1153,61 @@ def _hybrid_finish(
                     255,
                 )
 
-            # Texture detail: take only high-frequency AI luminance (not broad
-            # shading or object shape) and add it gently to source luminance.
-            # Material-specific gains are conservative to avoid inventing geometry.
-            sigma_detail = max(1.0, min(src.shape[:2]) / 160.0)
+            # Import visible AI-generated surface relief without importing its broad
+            # lighting or silhouette changes. Separate fine and medium bands: wood grain,
+            # fabric weave, leather pebble grain and concrete pores often live at different
+            # scales. The signal is centred within the selected region and capped robustly.
+            min_dim = float(min(src.shape[:2]))
+            sigma_fine = max(0.8, min_dim / 750.0)
+            sigma_mid = max(2.0, min_dim / 190.0)
+            sigma_large = max(5.0, min_dim / 85.0)
             ai_l = ai_lab[..., 0]
-            ai_l_smooth = cv2.GaussianBlur(
-                ai_l, (0, 0), sigmaX=sigma_detail, sigmaY=sigma_detail
+            l_fine = cv2.GaussianBlur(
+                ai_l, (0, 0), sigmaX=sigma_fine, sigmaY=sigma_fine
             )
-            ai_detail = np.clip(ai_l - ai_l_smooth, -18.0, 18.0)
-            detail_gain = {
-                "metal": 0.16, "bronze": 0.16, "wood": 0.20, "leather": 0.24,
-                "fabric": 0.22, "plastic": 0.12, "glass": 0.06,
-                "ceramic": 0.12, "concrete": 0.22,
-            }.get(material_key, 0.14)
-            detail_gain *= min(1.5, influence / 0.08)
-            original_l = source_lab[..., 0][m]
-            ai_l_detail = ai_detail[m] * detail_gain
-            base_lab[..., 0][m] = np.clip(original_l + ai_l_detail, 0, 255)
+            l_mid = cv2.GaussianBlur(
+                ai_l, (0, 0), sigmaX=sigma_mid, sigmaY=sigma_mid
+            )
+            l_large = cv2.GaussianBlur(
+                ai_l, (0, 0), sigmaX=sigma_large, sigmaY=sigma_large
+            )
+            fine_detail = ai_l - l_fine
+            mid_detail = l_fine - l_large
+            detail_profile = {
+                # (fine-band weight, medium-band weight, overall gain, clip)
+                "metal": (0.55, 0.80, 0.78, 25.0),
+                "bronze": (0.55, 0.80, 0.78, 25.0),
+                "wood": (0.70, 1.00, 0.88, 27.0),
+                "leather": (0.85, 0.90, 0.95, 28.0),
+                "fabric": (0.95, 0.80, 0.92, 26.0),
+                "plastic": (0.48, 0.62, 0.62, 20.0),
+                "glass": (0.20, 0.22, 0.28, 12.0),
+                "ceramic": (0.50, 0.62, 0.62, 20.0),
+                "concrete": (0.85, 1.00, 0.92, 27.0),
+            }
+            fine_weight, mid_weight, detail_gain, detail_clip = detail_profile.get(
+                material_key, (0.60, 0.70, 0.68, 22.0)
+            )
+            detail_signal = fine_detail * fine_weight + mid_detail * mid_weight
+            detail_region = detail_signal[m]
+            if detail_region.size:
+                detail_center = float(np.median(detail_region))
+                detail_signal = detail_signal - detail_center
+                robust_q = float(np.percentile(np.abs(detail_signal[m]), 92))
+                # Avoid amplifying isolated generated defects or edge artifacts.
+                clip_limit = min(detail_clip, max(5.0, robust_q * 1.15))
+                detail_signal = np.clip(detail_signal, -clip_limit, clip_limit)
+                # Influence acts as a strength control. Default is intentionally stronger
+                # than before, but the output remains based on source luminance/geometry.
+                detail_gain *= min(1.75, max(0.0, influence) / 0.08)
+                logger.info(
+                    "hybrid_finish: material=%s ai_texture_influence=%.3f detail_gain=%.3f "
+                    "fine_weight=%.2f mid_weight=%.2f",
+                    material_key, influence, detail_gain, fine_weight, mid_weight,
+                )
+                original_l = source_lab[..., 0][m]
+                ai_l_detail = detail_signal[m] * detail_gain
+                base_lab[..., 0][m] = np.clip(original_l + ai_l_detail, 0, 255)
 
     recolored_rgb = cv2.cvtColor(
         np.clip(base_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB
